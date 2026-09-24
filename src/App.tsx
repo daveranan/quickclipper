@@ -71,6 +71,7 @@ const defaultSettings: AppSettings = {
   saveFolder: '',
   ffmpegPath: 'ffmpeg',
   frameRate: 30,
+  captureBackend: 'desktopDuplication',
   maxMegabytes: 9.8,
   sizeCapEnabled: true,
   qualityTargetKbps: 10000,
@@ -1176,7 +1177,13 @@ function MainApp() {
     const request: RecordingRequest = { ...normalized, settings }
     await tauriInvoke<string>('start_recording', { request })
     setIsRecording(true)
-    setStatus(`Recording ${normalized.width}x${normalized.height} at ${normalized.x},${normalized.y}`)
+    setStatus(`Recording ${normalized.width}x${normalized.height} at ${normalized.x},${normalized.y} via ${settings.captureBackend === 'gdi' ? 'GDI' : 'Desktop Duplication'}`)
+  }
+
+  const selectCaptureBackend = (captureBackend: AppSettings['captureBackend']) => {
+    const nextSettings = { ...settings, captureBackend }
+    setSettings(nextSettings)
+    void tauriInvoke('save_settings', { settings: nextSettings }).catch((error) => setStatus(shortError(error)))
   }
 
   const resetRecording = async () => {
@@ -2088,11 +2095,20 @@ function MainApp() {
             <CardHeader>
               <CardTitle>Capture Region</CardTitle>
             </CardHeader>
-            <CardContent className="grid grid-cols-2 gap-2">
-              <NumberField label="X" value={recordingRegion.x} onChange={(x) => setRecordingRegion((region) => ({ ...region, x }))} />
-              <NumberField label="Y" value={recordingRegion.y} onChange={(y) => setRecordingRegion((region) => ({ ...region, y }))} />
-              <NumberField label="W" value={recordingRegion.width} onChange={(width) => setRecordingRegion((region) => ({ ...region, width }))} />
-              <NumberField label="H" value={recordingRegion.height} onChange={(height) => setRecordingRegion((region) => ({ ...region, height }))} />
+            <CardContent className="space-y-2">
+              <div className="space-y-1">
+                <Label>Capture Method</Label>
+                <Select value={settings.captureBackend} disabled={isRecording} onChange={(event) => selectCaptureBackend(event.target.value as AppSettings['captureBackend'])}>
+                  <option value="desktopDuplication">Desktop Duplication (GPU)</option>
+                  <option value="gdi">GDI (legacy)</option>
+                </Select>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <NumberField label="X" value={recordingRegion.x} onChange={(x) => setRecordingRegion((region) => ({ ...region, x }))} />
+                <NumberField label="Y" value={recordingRegion.y} onChange={(y) => setRecordingRegion((region) => ({ ...region, y }))} />
+                <NumberField label="W" value={recordingRegion.width} onChange={(width) => setRecordingRegion((region) => ({ ...region, width }))} />
+                <NumberField label="H" value={recordingRegion.height} onChange={(height) => setRecordingRegion((region) => ({ ...region, height }))} />
+              </div>
             </CardContent>
           </Card>
         </aside>

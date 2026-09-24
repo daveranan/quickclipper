@@ -6,6 +6,8 @@ In the viewer, **Copy Frame** pauses playback and copies the current frame to th
 
 While exporting, **Stop Export** cancels the active job and removes its temporary files. It also works for WAV exports, size-cap retries, and encoder benchmarks; completed benchmark files remain available.
 
+Recording uses FFmpeg Desktop Duplication by default to capture GPU-presented windows. The Capture Region panel can switch to the legacy GDI method for comparison. Desktop Duplication requires an FFmpeg build with the `ddagrab` filter and a region contained on one display; QuickClipper reports a clear error if either requirement is not met.
+
 ## Local development
 
 ```powershell

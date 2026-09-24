@@ -2,6 +2,7 @@ export type AppSettings = {
   saveFolder: string
   ffmpegPath: string
   frameRate: number
+  captureBackend: 'desktopDuplication' | 'gdi'
   maxMegabytes: number
   sizeCapEnabled: boolean
   qualityTargetKbps: number

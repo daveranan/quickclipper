@@ -59,6 +59,7 @@ pub struct AppSettings {
     save_folder: String,
     ffmpeg_path: String,
     frame_rate: u32,
+    capture_backend: CaptureBackend,
     max_megabytes: f64,
     #[serde(default = "default_true")]
     size_cap_enabled: bool,
@@ -96,6 +97,7 @@ impl Default for AppSettings {
             save_folder,
             ffmpeg_path: "ffmpeg".to_string(),
             frame_rate: 30,
+            capture_backend: CaptureBackend::default(),
             max_megabytes: 9.8,
             size_cap_enabled: true,
             quality_target_kbps: 10000,
@@ -115,6 +117,19 @@ impl Default for AppSettings {
             reset_hotkey: "Super+Shift+4".to_string(),
             github_repository_url: "https://github.com/daveranan/clipper".to_string(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum CaptureBackend {
+    DesktopDuplication,
+    Gdi,
+}
+
+impl Default for CaptureBackend {
+    fn default() -> Self {
+        Self::DesktopDuplication
     }
 }
 
@@ -1391,19 +1406,8 @@ fn spawn_recording(request: RecordingRequest) -> Result<ActiveRecording, String>
         "-stats_period".to_string(),
         "0.1".to_string(),
         "-y".to_string(),
-        "-f".to_string(),
-        "gdigrab".to_string(),
-        "-framerate".to_string(),
-        request.settings.frame_rate.clamp(5, 60).to_string(),
-        "-offset_x".to_string(),
-        request.x.to_string(),
-        "-offset_y".to_string(),
-        request.y.to_string(),
-        "-video_size".to_string(),
-        format!("{}x{}", width, height),
-        "-i".to_string(),
-        "desktop".to_string(),
     ];
+    args.extend(recording_input_args(&request, width, height)?);
 
     args.push("-an".to_string());
 
@@ -1470,6 +1474,185 @@ fn spawn_recording(request: RecordingRequest) -> Result<ActiveRecording, String>
         audio_lead_seconds,
         path,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CaptureDisplay {
+    output_idx: u32,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+fn recording_input_args(
+    request: &RecordingRequest,
+    width: u32,
+    height: u32,
+) -> Result<Vec<String>, String> {
+    let fps = request.settings.frame_rate.clamp(5, 60);
+    match request.settings.capture_backend {
+        CaptureBackend::Gdi => Ok(vec![
+            "-f".into(),
+            "gdigrab".into(),
+            "-framerate".into(),
+            fps.to_string(),
+            "-offset_x".into(),
+            request.x.to_string(),
+            "-offset_y".into(),
+            request.y.to_string(),
+            "-video_size".into(),
+            format!("{width}x{height}"),
+            "-i".into(),
+            "desktop".into(),
+        ]),
+        CaptureBackend::DesktopDuplication => {
+            ensure_desktop_duplication_supported(&request.settings.ffmpeg_path)?;
+            let displays = desktop_duplication_displays()?;
+            let (output_idx, offset_x, offset_y) = select_desktop_duplication_display(
+                request.x,
+                request.y,
+                width,
+                height,
+                &displays,
+            )?;
+            Ok(vec![
+                "-filter_complex".into(),
+                format!(
+                    "ddagrab=output_idx={output_idx}:framerate={fps}:video_size={width}x{height}:offset_x={offset_x}:offset_y={offset_y},hwdownload,format=bgra"
+                ),
+            ])
+        }
+    }
+}
+
+fn ensure_desktop_duplication_supported(ffmpeg_path: &str) -> Result<(), String> {
+    let output = hidden_command(ffmpeg_path)
+        .args(["-hide_banner", "-h", "filter=ddagrab"])
+        .output()
+        .map_err(|error| format!("Could not check FFmpeg Desktop Duplication support: {error}"))?;
+    let help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if output.status.success() && help.contains("Filter ddagrab") {
+        Ok(())
+    } else {
+        Err("This FFmpeg build does not support Desktop Duplication (ddagrab). Choose GDI in Capture Method or select a newer FFmpeg build.".to_string())
+    }
+}
+
+fn select_desktop_duplication_display(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    displays: &[CaptureDisplay],
+) -> Result<(u32, i32, i32), String> {
+    let right = i64::from(x) + i64::from(width);
+    let bottom = i64::from(y) + i64::from(height);
+    for display in displays {
+        if x >= display.left
+            && y >= display.top
+            && right <= i64::from(display.right)
+            && bottom <= i64::from(display.bottom)
+        {
+            let offset_x = i32::try_from(i64::from(x) - i64::from(display.left))
+                .map_err(|_| "Recording region coordinates are too large.".to_string())?;
+            let offset_y = i32::try_from(i64::from(y) - i64::from(display.top))
+                .map_err(|_| "Recording region coordinates are too large.".to_string())?;
+            return Ok((
+                display.output_idx,
+                offset_x,
+                offset_y,
+            ));
+        }
+    }
+    Err("Desktop Duplication needs the recording region to fit within one display. Select a region on one monitor or choose GDI in Capture Method.".to_string())
+}
+
+#[cfg(windows)]
+fn desktop_duplication_displays() -> Result<Vec<CaptureDisplay>, String> {
+    use windows::{
+        core::Interface,
+        Win32::{
+            Graphics::{
+                Direct3D::D3D_DRIVER_TYPE_HARDWARE,
+                Direct3D11::{
+                    D3D11CreateDevice, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION, ID3D11Device,
+                },
+                Dxgi::IDXGIDevice,
+            },
+            UI::HiDpi::{
+                SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            },
+        },
+    };
+
+    struct RestoreDpiContext(DPI_AWARENESS_CONTEXT);
+    impl Drop for RestoreDpiContext {
+        fn drop(&mut self) {
+            unsafe { SetThreadDpiAwarenessContext(self.0) };
+        }
+    }
+
+    // The region selector and FFmpeg use physical pixels. DXGI output bounds
+    // are virtualized for DPI-unaware callers unless this thread is DPI aware.
+    let previous_dpi_context =
+        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    let _restore_dpi_context = RestoreDpiContext(previous_dpi_context);
+
+    let mut device: Option<ID3D11Device> = None;
+    unsafe {
+        D3D11CreateDevice(
+            None,
+            D3D_DRIVER_TYPE_HARDWARE,
+            None,
+            D3D11_CREATE_DEVICE_FLAG(0),
+            None,
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            None,
+        )
+    }
+    .map_err(|error| format!("Could not identify the Desktop Duplication display: {error}"))?;
+    let device = device.ok_or("Direct3D did not return a capture device.")?;
+    let dxgi_device: IDXGIDevice = device
+        .cast()
+        .map_err(|error| format!("Could not identify the graphics adapter: {error}"))?;
+    let adapter = unsafe { dxgi_device.GetAdapter() }
+        .map_err(|error| format!("Could not identify the graphics adapter: {error}"))?;
+    let mut displays = Vec::new();
+    for output_idx in 0..32 {
+        let output = match unsafe { adapter.EnumOutputs(output_idx) } {
+            Ok(output) => output,
+            Err(_) => break,
+        };
+        let desc = unsafe { output.GetDesc() }
+            .map_err(|error| format!("Could not read a display's bounds: {error}"))?;
+        if desc.AttachedToDesktop.as_bool() {
+            let rect = desc.DesktopCoordinates;
+            displays.push(CaptureDisplay {
+                output_idx,
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+            });
+        }
+    }
+    if displays.is_empty() {
+        return Err("Desktop Duplication found no active displays on the capture adapter.".to_string());
+    }
+    Ok(displays)
+}
+
+#[cfg(not(windows))]
+fn desktop_duplication_displays() -> Result<Vec<CaptureDisplay>, String> {
+    Err("Desktop Duplication is only available on Windows.".to_string())
 }
 
 #[tauri::command]
@@ -2952,6 +3135,81 @@ mod tests {
         let settings: AppSettings = serde_json::from_str(json).expect("deserialize AppSettings");
         assert_eq!(settings.audio_quality, "best");
         assert!(settings.best_audio);
+        assert_eq!(settings.capture_backend, CaptureBackend::DesktopDuplication);
+    }
+
+    #[test]
+    fn desktop_duplication_uses_physical_display_coordinates() {
+        let displays = [
+            CaptureDisplay {
+                output_idx: 0,
+                left: 0,
+                top: 0,
+                right: 3440,
+                bottom: 1440,
+            },
+            CaptureDisplay {
+                output_idx: 1,
+                left: 349,
+                top: 1440,
+                right: 2909,
+                bottom: 2880,
+            },
+        ];
+        assert_eq!(
+            select_desktop_duplication_display(400, 1500, 1174, 1114, &displays).unwrap(),
+            (1, 51, 60)
+        );
+        assert_eq!(
+            select_desktop_duplication_display(100, 200, 640, 360, &displays).unwrap(),
+            (0, 100, 200)
+        );
+        assert!(select_desktop_duplication_display(100, 1300, 640, 360, &displays).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an interactive Windows graphics device"]
+    fn desktop_duplication_lists_live_outputs() {
+        let displays = desktop_duplication_displays().unwrap();
+        eprintln!("DXGI capture outputs: {displays:?}");
+        assert!(!displays.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "captures the interactive Windows desktop with FFmpeg"]
+    fn desktop_duplication_records_live_region() {
+        let display = desktop_duplication_displays().unwrap()[0];
+        let folder = tempfile::tempdir().unwrap();
+        let video = folder.path().join("capture.mp4");
+        let mut settings = AppSettings::default();
+        settings.ffmpeg_path = std::env::var("QUICKCLIPPER_TEST_FFMPEG")
+            .unwrap_or_else(|_| "ffmpeg".to_string());
+        let request = RecordingRequest {
+            x: display.left + 20,
+            y: display.top + 20,
+            width: 320,
+            height: 180,
+            settings: settings.clone(),
+        };
+        let mut args = vec!["-hide_banner".into(), "-loglevel".into(), "error".into(), "-y".into()];
+        args.extend(recording_input_args(&request, 320, 180).unwrap());
+        args.extend([
+            "-t".into(),
+            "1".into(),
+            "-an".into(),
+            "-c:v".into(),
+            "libx264".into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+            video.to_string_lossy().to_string(),
+        ]);
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        run_command(&settings.ffmpeg_path, &refs, "Desktop Duplication test failed").unwrap();
+        let info = probe_video_file(&settings, &video, &video).unwrap().unwrap();
+        assert_eq!((info.width, info.height), (320, 180));
+        assert!(info.duration_seconds >= 0.9);
     }
 
     #[test]
