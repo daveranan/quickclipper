@@ -35,6 +35,39 @@ textarea {
   min-height: 100vh;
 }
 
+:root.transparent-window,
+:root.transparent-window body {
+  min-width: 0;
+  min-height: 0;
+  background: transparent;
+}
+
+.recording-overlay {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+}
+
+.recording-overlay-timer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  padding: 4px 8px;
+  background: rgba(17, 17, 17, 0.8);
+  color: #fff;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.recording-overlay-frame {
+  position: absolute;
+  top: 33px;
+  right: 0;
+  bottom: 3px;
+  left: 0;
+  border: 3px solid rgb(229, 72, 77);
+}
+
 .region-selector {
   position: fixed;
   inset: 0;

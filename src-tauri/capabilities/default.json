@@ -4,7 +4,7 @@
   "description": "enables the default permissions",
   "windows": [
     "main",
-    "region-selector"
+    "region-selector*"
   ],
   "permissions": [
     "core:default",

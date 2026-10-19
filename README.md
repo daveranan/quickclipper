@@ -10,6 +10,20 @@ While exporting, **Stop Export** cancels the active job and removes its temporar
 
 Recording uses FFmpeg Desktop Duplication by default to capture GPU-presented windows. The Capture Region panel can switch to the legacy GDI method for comparison. Desktop Duplication requires an FFmpeg build with the `ddagrab` filter and a region contained on one display; QuickClipper reports a clear error if either requirement is not met.
 
+## macOS
+
+QuickClipper also runs on macOS 13 or later, with the same recording, editing and export features. Differences from Windows:
+
+- Recording uses FFmpeg's AVFoundation screen input at the display's full Retina resolution, so a 400x225 region records as 800x450 on a 2x display. The region has to fit on one display.
+- System audio is captured with ScreenCaptureKit, with no virtual audio driver needed.
+- macOS asks for **Screen & System Audio Recording** permission the first time you record. Allow QuickClipper in System Settings > Privacy & Security, then reopen it.
+- The region selector and the recording timer/border also appear over full-screen apps and games. While they are open, QuickClipper briefly hides its Dock icon, because macOS only allows accessory apps over another app's full-screen Space.
+- Exports can use the VideoToolbox H.264/H.265 hardware encoders instead of NVENC.
+- The default hotkeys are Control+Shift+R and Control+Shift+4, because Cmd+Shift+4 is the system screenshot shortcut.
+- Install FFmpeg with `brew install ffmpeg`. QuickClipper finds it in `/opt/homebrew/bin` or `/usr/local/bin` even when started from Finder or at login.
+
+Building needs Xcode or the Xcode Command Line Tools, because the ScreenCaptureKit bridge is compiled from Swift. `npm run tauri build` produces `QuickClipper.app` and a `.dmg` in `src-tauri/target/release/bundle/`.
+
 ## Local development
 
 ```powershell

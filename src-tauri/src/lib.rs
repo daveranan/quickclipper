@@ -27,11 +27,22 @@ use export_job::{ExportControl, ExportJobs};
 struct AppState {
     recording: Mutex<Option<ActiveRecording>>,
     exports: ExportJobs,
+    /// The open region selection on macOS: its generation (part of every
+    /// selector window label) and where to deliver the result.
+    #[cfg(target_os = "macos")]
+    region_selection: Mutex<Option<(u64, mpsc::Sender<Option<RecordingRegion>>)>>,
 }
+
+// Windows draws the overlay from a PowerShell process; macOS uses a
+// transparent webview window owned by this process.
+#[cfg(not(target_os = "macos"))]
+type RecordingOverlay = Child;
+#[cfg(target_os = "macos")]
+type RecordingOverlay = tauri::WebviewWindow;
 
 struct ActiveRecording {
     child: Child,
-    overlay_child: Option<Child>,
+    overlay_child: Option<RecordingOverlay>,
     audio: Option<LoopbackRecording>,
     audio_lead_seconds: f64,
     path: PathBuf,
@@ -113,8 +124,8 @@ impl Default for AppSettings {
             audio_device_name: String::new(),
             start_with_windows: true,
             start_hidden_in_tray: true,
-            record_hotkey: "Super+Shift+R".to_string(),
-            reset_hotkey: "Super+Shift+4".to_string(),
+            record_hotkey: default_record_hotkey().to_string(),
+            reset_hotkey: default_reset_hotkey().to_string(),
             github_repository_url: "https://github.com/daveranan/clipper".to_string(),
         }
     }
@@ -130,6 +141,24 @@ enum CaptureBackend {
 impl Default for CaptureBackend {
     fn default() -> Self {
         Self::DesktopDuplication
+    }
+}
+
+// Super+Shift+4 is the macOS screenshot shortcut, and Cmd+Shift+R reloads
+// pages in browsers, so macOS gets Control-based defaults.
+fn default_record_hotkey() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Control+Shift+R"
+    } else {
+        "Super+Shift+R"
+    }
+}
+
+fn default_reset_hotkey() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Control+Shift+4"
+    } else {
+        "Super+Shift+4"
     }
 }
 
@@ -615,13 +644,58 @@ fn choose_save_folder(current: String) -> Result<Option<String>, String> {
 
 #[tauri::command]
 fn choose_ffmpeg_path() -> Result<Option<String>, String> {
-    Ok(rfd::FileDialog::new()
-        .add_filter("FFmpeg", &["exe"])
-        .set_file_name("ffmpeg.exe")
+    let dialog = rfd::FileDialog::new();
+    #[cfg(windows)]
+    let dialog = dialog.add_filter("FFmpeg", &["exe"]).set_file_name("ffmpeg.exe");
+    Ok(dialog
         .pick_file()
         .map(|path| path.to_string_lossy().to_string()))
 }
 
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn list_audio_devices(settings: AppSettings) -> Result<Vec<String>, String> {
+    let output = hidden_command(&settings.ffmpeg_path)
+        .args([
+            "-hide_banner",
+            "-f",
+            "avfoundation",
+            "-list_devices",
+            "true",
+            "-i",
+            "",
+        ])
+        .output()
+        .map_err(|error| format!("Audio device scan failed: {}", error))?;
+    let text = String::from_utf8_lossy(&output.stderr);
+    let mut devices = Vec::new();
+    let mut in_audio_section = false;
+    for line in text.lines() {
+        if line.contains("AVFoundation audio devices:") {
+            in_audio_section = true;
+            continue;
+        }
+        if line.contains("AVFoundation video devices:") {
+            in_audio_section = false;
+            continue;
+        }
+        if !in_audio_section {
+            continue;
+        }
+        // Lines look like "[AVFoundation indev @ 0x...] [0] MacBook Pro Microphone".
+        if let Some((_, rest)) = line.split_once("] [") {
+            if let Some((_, name)) = rest.split_once("] ") {
+                let name = name.trim().to_string();
+                if !name.is_empty() && !devices.contains(&name) {
+                    devices.push(name);
+                }
+            }
+        }
+    }
+    Ok(devices)
+}
+
+#[cfg(not(target_os = "macos"))]
 #[tauri::command]
 fn list_audio_devices(settings: AppSettings) -> Result<Vec<String>, String> {
     let output = hidden_command(&settings.ffmpeg_path)
@@ -654,6 +728,7 @@ fn list_audio_devices(settings: AppSettings) -> Result<Vec<String>, String> {
     Ok(devices)
 }
 
+#[cfg(not(target_os = "macos"))]
 #[tauri::command]
 fn open_region_selector() -> Result<Option<RecordingRegion>, String> {
     let script = r#"
@@ -775,6 +850,239 @@ if ($script:result -and $script:result -ne 'cancel') { Write-Output $script:resu
     serde_json::from_str::<RecordingRegion>(&text)
         .map(Some)
         .map_err(|error| format!("Region selector returned invalid data: {}", error))
+}
+
+#[cfg(target_os = "macos")]
+const REGION_SELECTOR_LABEL: &str = "region-selector";
+
+/// Covers every display with a transparent selector window and waits for the
+/// user to drag a region on one of them. The region is returned in global
+/// display points (top-left origin of the main display), which is what
+/// CoreGraphics and window positioning on macOS use.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn open_region_selector(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<RecordingRegion>, String> {
+    static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    let (sender, receiver) = mpsc::channel();
+    {
+        let mut pending = state
+            .region_selection
+            .lock()
+            .map_err(|_| "Region selector lock failed.".to_string())?;
+        if let Some((_, previous)) = pending.replace((generation, sender)) {
+            let _ = previous.send(None);
+        }
+    }
+    close_region_selectors(&app);
+
+    let monitors = app
+        .available_monitors()
+        .map_err(|error| format!("Could not list displays: {error}"))?;
+    if monitors.is_empty() {
+        return Err("No displays are available for recording.".to_string());
+    }
+    // Started from the hotkey or the menu bar while another app (usually a
+    // game) is in front. Activating the selector would bring the editor into
+    // view behind it, so keep the editor hidden until the recording stops, as
+    // on Windows, and give focus back to that app once a region is chosen.
+    let previous_app = on_main_thread(&app, || unsafe { frontmost_other_app() }).flatten();
+    if previous_app.is_some() {
+        if let Some(main) = app.get_webview_window("main") {
+            let _ = main.hide();
+        }
+    }
+    let restore = |app: &tauri::AppHandle| {
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+        if let Some(pid) = previous_app {
+            on_main_thread(app, move || unsafe { activate_app(pid) });
+        }
+    };
+
+    // macOS only lets accessory apps put windows over another app's
+    // full-screen Space, which is where games usually are.
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+    if let Err(error) = open_region_selector_windows(&app, generation, &monitors) {
+        let _ = state.region_selection.lock().map(|mut pending| pending.take());
+        close_region_selectors(&app);
+        restore(&app);
+        return Err(error);
+    }
+    // Take keyboard focus so Escape reaches the selector instead of the game.
+    on_main_thread(&app, || unsafe { activate_current_app() });
+
+    let selection = tauri::async_runtime::spawn_blocking(move || receiver.recv().ok().flatten())
+        .await
+        .map_err(|error| format!("Region selector failed: {error}"))?;
+    close_region_selectors(&app);
+    restore(&app);
+    Ok(selection)
+}
+
+/// Runs `task` on the AppKit main thread and waits for its result. Must not
+/// be called from the main thread itself.
+#[cfg(target_os = "macos")]
+fn on_main_thread<T: Send + 'static>(
+    app: &tauri::AppHandle,
+    task: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    app.run_on_main_thread(move || {
+        let _ = sender.send(task());
+    })
+    .ok()?;
+    receiver.recv_timeout(Duration::from_secs(2)).ok()
+}
+
+/// The process id of the frontmost app, unless that is QuickClipper.
+#[cfg(target_os = "macos")]
+unsafe fn frontmost_other_app() -> Option<i32> {
+    use objc2::{class, msg_send, runtime::AnyObject};
+    let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+    let frontmost: *mut AnyObject = msg_send![workspace, frontmostApplication];
+    if frontmost.is_null() {
+        return None;
+    }
+    let pid: i32 = msg_send![frontmost, processIdentifier];
+    (pid != std::process::id() as i32).then_some(pid)
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn activate_app(pid: i32) {
+    use objc2::{class, msg_send, runtime::AnyObject};
+    let app: *mut AnyObject =
+        msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+    if !app.is_null() {
+        let _: bool = msg_send![app, activateWithOptions: 0_usize];
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn activate_current_app() {
+    use objc2::{class, msg_send, runtime::AnyObject};
+    let ns_app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+    let _: () = msg_send![ns_app, activateIgnoringOtherApps: true];
+}
+
+#[cfg(target_os = "macos")]
+fn open_region_selector_windows(
+    app: &tauri::AppHandle,
+    generation: u64,
+    monitors: &[tauri::Monitor],
+) -> Result<(), String> {
+    let cursor = app.cursor_position().ok();
+    for (index, monitor) in monitors.iter().enumerate() {
+        let scale = monitor.scale_factor();
+        let origin = monitor.position().to_logical::<f64>(scale);
+        let size = monitor.size().to_logical::<f64>(scale);
+        let url = format!(
+            "index.html?selector=1&originX={}&originY={}",
+            origin.x, origin.y
+        );
+        let contains_cursor = cursor.is_some_and(|point| {
+            let point = point.to_logical::<f64>(scale);
+            point.x >= origin.x
+                && point.y >= origin.y
+                && point.x < origin.x + size.width
+                && point.y < origin.y + size.height
+        });
+        let window = tauri::WebviewWindowBuilder::new(
+            app,
+            format!("{REGION_SELECTOR_LABEL}-{generation}-{index}"),
+            tauri::WebviewUrl::App(url.into()),
+        )
+        .title("QuickClipper Region")
+        .decorations(false)
+        .transparent(true)
+        .shadow(false)
+        .resizable(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .visible_on_all_workspaces(true)
+        .focused(contains_cursor || index == 0)
+        .inner_size(size.width, size.height)
+        .position(origin.x, origin.y)
+        .build()
+        .map_err(|error| format!("Region selector failed: {error}"))?;
+        raise_above_menu_bar(&window);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn finish_region_selection(
+    region: Option<RecordingRegion>,
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    deliver_region_selection(&state, window.label(), region);
+    Ok(())
+}
+
+/// Hands the result to the selection that opened `label`, ignoring selector
+/// windows left over from an earlier selection.
+#[cfg(target_os = "macos")]
+fn deliver_region_selection(state: &AppState, label: &str, region: Option<RecordingRegion>) {
+    let Some(generation) = label
+        .strip_prefix(REGION_SELECTOR_LABEL)
+        .and_then(|rest| rest.split('-').nth(1))
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let Ok(mut pending) = state.region_selection.lock() else {
+        return;
+    };
+    if pending.as_ref().is_some_and(|(current, _)| *current == generation) {
+        if let Some((_, sender)) = pending.take() {
+            let _ = sender.send(region);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+fn finish_region_selection(_region: Option<RecordingRegion>) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn close_region_selectors(app: &tauri::AppHandle) {
+    for (label, window) in app.webview_windows() {
+        if label.starts_with(REGION_SELECTOR_LABEL) {
+            let _ = window.destroy();
+        }
+    }
+}
+
+/// Floating windows sit below the menu bar and Dock, and stay out of other
+/// apps' full-screen Spaces. The selector and the recording overlay have to
+/// reach every pixel a region can include, including full-screen games (this
+/// also needs the accessory activation policy while they are open).
+#[cfg(target_os = "macos")]
+fn raise_above_menu_bar(window: &tauri::WebviewWindow) {
+    const NS_STATUS_WINDOW_LEVEL: isize = 25;
+    const CAN_JOIN_ALL_SPACES: usize = 1 << 0;
+    const STATIONARY: usize = 1 << 4;
+    const IGNORES_CYCLE: usize = 1 << 6;
+    const FULL_SCREEN_AUXILIARY: usize = 1 << 8;
+    let Ok(ns_window) = window.ns_window() else {
+        return;
+    };
+    let ns_window = ns_window as usize;
+    let _ = window.run_on_main_thread(move || unsafe {
+        let ns_window = ns_window as *mut objc2::runtime::AnyObject;
+        let _: () = objc2::msg_send![ns_window, setLevel: NS_STATUS_WINDOW_LEVEL];
+        let behavior = CAN_JOIN_ALL_SPACES | STATIONARY | IGNORES_CYCLE | FULL_SCREEN_AUXILIARY;
+        let _: () = objc2::msg_send![ns_window, setCollectionBehavior: behavior];
+        // Re-order so the new behavior moves the window into the Space that
+        // is showing on its display right now.
+        let _: () = objc2::msg_send![ns_window, orderFrontRegardless];
+    });
 }
 
 #[tauri::command]
@@ -1381,6 +1689,7 @@ fn benchmark_encoders_sync(request: ExportRequest, control: &ExportControl) -> R
 #[tauri::command]
 fn start_recording(
     request: RecordingRequest,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let mut recording = state
@@ -1391,13 +1700,13 @@ fn start_recording(
         return Err("Recording is already running.".to_string());
     }
 
-    let active = spawn_recording(request)?;
+    let active = spawn_recording(request, &app)?;
     let path = active.path.clone();
     *recording = Some(active);
     Ok(path.to_string_lossy().to_string())
 }
 
-fn spawn_recording(request: RecordingRequest) -> Result<ActiveRecording, String> {
+fn spawn_recording(request: RecordingRequest, app: &tauri::AppHandle) -> Result<ActiveRecording, String> {
     let path = media_root()?.join(format!("recording-{}.mp4", timestamp()));
     let width = make_even(request.width).max(2);
     let height = make_even(request.height).max(2);
@@ -1466,7 +1775,7 @@ fn spawn_recording(request: RecordingRequest) -> Result<ActiveRecording, String>
     }
 
     let overlay_child =
-        start_recording_overlay(std::process::id(), request.x, request.y, width, height).ok();
+        start_recording_overlay(app, std::process::id(), request.x, request.y, width, height).ok();
     Ok(ActiveRecording {
         child,
         overlay_child,
@@ -1485,6 +1794,16 @@ struct CaptureDisplay {
     bottom: i32,
 }
 
+#[cfg(target_os = "macos")]
+fn recording_input_args(
+    request: &RecordingRequest,
+    _width: u32,
+    _height: u32,
+) -> Result<Vec<String>, String> {
+    avfoundation_input_args(request, request.settings.frame_rate.clamp(5, 60))
+}
+
+#[cfg(not(target_os = "macos"))]
 fn recording_input_args(
     request: &RecordingRequest,
     width: u32,
@@ -1526,6 +1845,7 @@ fn recording_input_args(
     }
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn ensure_desktop_duplication_supported(ffmpeg_path: &str) -> Result<(), String> {
     let output = hidden_command(ffmpeg_path)
         .args(["-hide_banner", "-h", "filter=ddagrab"])
@@ -1651,8 +1971,146 @@ fn desktop_duplication_displays() -> Result<Vec<CaptureDisplay>, String> {
 }
 
 #[cfg(not(windows))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn desktop_duplication_displays() -> Result<Vec<CaptureDisplay>, String> {
     Err("Desktop Duplication is only available on Windows.".to_string())
+}
+
+/// macOS records through FFmpeg's AVFoundation screen input. Regions arrive in
+/// global display points; the capture runs at the display's backing pixel
+/// resolution, so the crop is scaled into pixels of the chosen screen.
+#[cfg(target_os = "macos")]
+fn avfoundation_input_args(request: &RecordingRequest, fps: u32) -> Result<Vec<String>, String> {
+    let screens = macos_capture_screens()?;
+    let displays: Vec<CaptureDisplay> = screens.iter().map(|screen| screen.bounds).collect();
+    let (screen_index, offset_x, offset_y) = select_desktop_duplication_display(
+        request.x,
+        request.y,
+        request.width,
+        request.height,
+        &displays,
+    )
+    .map_err(|_| "The recording region has to fit within one display. Select a region on one screen.".to_string())?;
+    let screen = screens
+        .iter()
+        .find(|screen| screen.bounds.output_idx == screen_index)
+        .ok_or("The selected display is no longer available.")?;
+    let to_pixels = |points: f64| (points * screen.scale).round().max(0.0) as u32;
+    let crop_x = to_pixels(f64::from(offset_x)).min(screen.pixel_width.saturating_sub(2));
+    let crop_y = to_pixels(f64::from(offset_y)).min(screen.pixel_height.saturating_sub(2));
+    let crop_width = make_even(to_pixels(f64::from(request.width)).min(screen.pixel_width - crop_x)).max(2);
+    let crop_height = make_even(to_pixels(f64::from(request.height)).min(screen.pixel_height - crop_y)).max(2);
+    Ok(vec![
+        "-f".into(),
+        "avfoundation".into(),
+        "-capture_cursor".into(),
+        "1".into(),
+        "-framerate".into(),
+        fps.to_string(),
+        "-pixel_format".into(),
+        "nv12".into(),
+        "-i".into(),
+        format!("Capture screen {screen_index}:none"),
+        "-vf".into(),
+        format!("crop={crop_width}:{crop_height}:{crop_x}:{crop_y}"),
+    ])
+}
+
+/// Reads the host-clock time of the first captured frame from FFmpeg's input
+/// summary ("Input #0, avfoundation, ..." followed by "Duration: N/A, start: 1234.5, ...").
+#[cfg(target_os = "macos")]
+fn avfoundation_start_seconds(stderr: &str) -> Option<f64> {
+    let mut lines = stderr.lines().skip_while(|line| !line.contains("Input #0, avfoundation"));
+    lines.next()?;
+    lines.take(3).find_map(|line| {
+        let (_, rest) = line.split_once("start: ")?;
+        rest.split(',').next()?.trim().parse().ok()
+    })
+}
+
+#[cfg(target_os = "macos")]
+struct MacCaptureScreen {
+    /// Bounds in global points, indexed like FFmpeg's "Capture screen N".
+    bounds: CaptureDisplay,
+    scale: f64,
+    pixel_width: u32,
+    pixel_height: u32,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_capture_screens() -> Result<Vec<MacCaptureScreen>, String> {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGSize {
+        width: f64,
+        height: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGRect {
+        origin: CGPoint,
+        size: CGSize,
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+        fn CGDisplayBounds(display: u32) -> CGRect;
+        fn CGDisplayCopyDisplayMode(display: u32) -> *mut c_void;
+        fn CGDisplayModeGetPixelWidth(mode: *mut c_void) -> usize;
+        fn CGDisplayModeGetPixelHeight(mode: *mut c_void) -> usize;
+        fn CGDisplayModeRelease(mode: *mut c_void);
+    }
+
+    // FFmpeg numbers "Capture screen N" in CGGetActiveDisplayList order.
+    let mut ids = [0_u32; 32];
+    let mut count = 0_u32;
+    let status = unsafe { CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
+    if status != 0 {
+        return Err(format!("Could not list displays (CoreGraphics error {status})."));
+    }
+    let mut screens = Vec::new();
+    for (index, id) in ids.iter().take(count as usize).enumerate() {
+        let bounds = unsafe { CGDisplayBounds(*id) };
+        let (pixel_width, pixel_height) = unsafe {
+            let mode = CGDisplayCopyDisplayMode(*id);
+            if mode.is_null() {
+                (bounds.size.width as usize, bounds.size.height as usize)
+            } else {
+                let size = (CGDisplayModeGetPixelWidth(mode), CGDisplayModeGetPixelHeight(mode));
+                CGDisplayModeRelease(mode);
+                size
+            }
+        };
+        if bounds.size.width <= 0.0 || pixel_width == 0 || pixel_height == 0 {
+            continue;
+        }
+        let left = bounds.origin.x.round() as i32;
+        let top = bounds.origin.y.round() as i32;
+        screens.push(MacCaptureScreen {
+            bounds: CaptureDisplay {
+                output_idx: index as u32,
+                left,
+                top,
+                right: left + bounds.size.width.round() as i32,
+                bottom: top + bounds.size.height.round() as i32,
+            },
+            scale: pixel_width as f64 / bounds.size.width,
+            pixel_width: pixel_width as u32,
+            pixel_height: pixel_height as u32,
+        });
+    }
+    if screens.is_empty() {
+        return Err("No active displays are available for recording.".to_string());
+    }
+    Ok(screens)
 }
 
 #[tauri::command]
@@ -1666,6 +2124,11 @@ fn stop_recording(settings: AppSettings, state: State<'_, AppState>) -> Result<V
     };
 
     stop_recording_overlay(&mut recording.overlay_child);
+    #[cfg(target_os = "macos")]
+    let audio_host_started_at = recording
+        .audio
+        .as_ref()
+        .map(|audio| host_time_seconds() - audio.started_at.elapsed().as_secs_f64());
     let mut stop_signal_error = None;
     if let Some(stdin) = recording.child.stdin.as_mut() {
         if let Err(error) = stdin.write_all(b"q\n") {
@@ -1701,12 +2164,22 @@ fn stop_recording(settings: AppSettings, state: State<'_, AppState>) -> Result<V
         }
         return Err(error);
     }
+    // AVFoundation takes most of a second to deliver its first frame. Its
+    // timestamps share the host clock with the audio capture, so measure the
+    // lead from the first frame instead of from process start.
+    #[cfg(target_os = "macos")]
+    let audio_lead_seconds = audio_host_started_at
+        .zip(avfoundation_start_seconds(&String::from_utf8_lossy(&output.stderr)))
+        .map(|(audio_start, video_start)| (video_start - audio_start).max(0.0))
+        .unwrap_or(recording.audio_lead_seconds);
+    #[cfg(not(target_os = "macos"))]
+    let audio_lead_seconds = recording.audio_lead_seconds;
     if let Some(audio_path) = audio_result? {
         mux_recording_audio(
             &settings.ffmpeg_path,
             &recording.path,
             &audio_path,
-            recording.audio_lead_seconds,
+            audio_lead_seconds,
         )?;
     }
 
@@ -1717,6 +2190,7 @@ fn stop_recording(settings: AppSettings, state: State<'_, AppState>) -> Result<V
 #[tauri::command]
 fn reset_recording(
     request: RecordingRequest,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let mut guard = state
@@ -1736,7 +2210,7 @@ fn reset_recording(
         let _ = fs::remove_file(path);
     }
 
-    let active = spawn_recording(request)?;
+    let active = spawn_recording(request, &app)?;
     let path = active.path.clone();
     *guard = Some(active);
     Ok(path.to_string_lossy().to_string())
@@ -1745,7 +2219,18 @@ fn reset_recording(
 #[tauri::command]
 fn reveal_path(path: String) -> Result<(), String> {
     let target = PathBuf::from(path);
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        if target.is_file() {
+            command.arg("-R");
+        }
+        command.arg(&target);
+        command
+    };
+    #[cfg(not(target_os = "macos"))]
     let mut command = Command::new("explorer.exe");
+    #[cfg(not(target_os = "macos"))]
     if target.is_file() {
         command.arg(format!("/select,{}", target.to_string_lossy()));
     } else {
@@ -1783,7 +2268,7 @@ fn probe_video_file_with_control(
     original_path: &Path,
     control: &ExportControl,
 ) -> Result<Option<VideoInfo>, String> {
-    let ffprobe = sibling_tool(&settings.ffmpeg_path, "ffprobe.exe");
+    let ffprobe = sibling_tool(&settings.ffmpeg_path, FFPROBE);
     let output = control.output(hidden_command(&ffprobe)
         .args([
             "-v",
@@ -1839,7 +2324,7 @@ fn is_browser_safe_playback(settings: &AppSettings, media_path: &Path) -> Result
         return Ok(false);
     }
 
-    let ffprobe = sibling_tool(&settings.ffmpeg_path, "ffprobe.exe");
+    let ffprobe = sibling_tool(&settings.ffmpeg_path, FFPROBE);
     let output = hidden_command(&ffprobe)
         .args([
             "-v",
@@ -1872,7 +2357,7 @@ fn is_browser_safe_playback(settings: &AppSettings, media_path: &Path) -> Result
 }
 
 fn source_has_audio_with_control(settings: &AppSettings, media_path: &Path, control: &ExportControl) -> Result<bool, String> {
-    let ffprobe = sibling_tool(&settings.ffmpeg_path, "ffprobe.exe");
+    let ffprobe = sibling_tool(&settings.ffmpeg_path, FFPROBE);
     control.output(hidden_command(&ffprobe)
         .args([
             "-v",
@@ -1931,6 +2416,8 @@ fn ensure_parent(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+const FFPROBE: &str = if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" };
+
 fn sibling_tool(ffmpeg_path: &str, tool: &str) -> String {
     let ffmpeg = Path::new(ffmpeg_path);
     if ffmpeg.is_absolute() {
@@ -1945,7 +2432,8 @@ fn sibling_tool(ffmpeg_path: &str, tool: &str) -> String {
 }
 
 fn hidden_command(program: &str) -> Command {
-    let mut command = Command::new(program);
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut command = Command::new(resolve_program(program));
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -1965,7 +2453,28 @@ fn hidden_command(program: &str) -> Command {
     command
 }
 
-#[cfg(windows)]
+/// Apps started from Finder or at login get a minimal PATH without Homebrew,
+/// so bare tool names such as "ffmpeg" fall back to the Homebrew locations.
+#[cfg(target_os = "macos")]
+fn resolve_program(program: &str) -> PathBuf {
+    let path = Path::new(program);
+    if path.components().count() != 1 {
+        return path.to_path_buf();
+    }
+    let search_path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&search_path)
+        .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from))
+        .map(|folder| folder.join(program))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn resolve_program(program: &str) -> PathBuf {
+    PathBuf::from(program)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 fn start_loopback_recording() -> Result<LoopbackRecording, String> {
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&stop);
@@ -1990,9 +2499,9 @@ fn start_loopback_recording() -> Result<LoopbackRecording, String> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn start_loopback_recording() -> Result<LoopbackRecording, String> {
-    Err("System audio capture is only available on Windows.".to_string())
+    Err("System audio capture is only available on Windows and macOS.".to_string())
 }
 
 fn stop_loopback_recording(
@@ -2251,6 +2760,229 @@ fn capture_loopback_to_wav(
     }
 }
 
+/// Captures system audio through ScreenCaptureKit and writes it as 32-bit
+/// float WAV on the same timeline contract as the Windows loopback capture:
+/// the file starts at the moment capture is reported ready, gaps are filled
+/// with silence, and the tail is padded to wall-clock length.
+#[cfg(target_os = "macos")]
+fn capture_loopback_to_wav(
+    stop: Arc<AtomicBool>,
+    path: PathBuf,
+    ready_sender: mpsc::SyncSender<Result<Instant, String>>,
+) -> Result<Option<PathBuf>, String> {
+    use screencapturekit::{cm::CMSampleBuffer, prelude::*};
+
+    const SAMPLE_RATE: u32 = 48_000;
+    const CHANNELS: usize = 2;
+    // Packet timestamps within this many frames of the expected position are
+    // treated as contiguous, so timestamp rounding never becomes a click.
+    const JITTER_FRAMES: u64 = 96;
+
+    let mut ready_sender = Some(ready_sender);
+    let result = (|| -> Result<Option<PathBuf>, String> {
+        let content = SCShareableContent::get()
+            .map_err(|error| screen_capture_permission_error(&error.to_string()))?;
+        let display = content
+            .displays()
+            .into_iter()
+            .next()
+            .ok_or("No display is available for system audio capture.")?;
+        let filter = SCContentFilter::create()
+            .with_display(&display)
+            .with_excluding_windows(&[])
+            .build();
+        // Only the audio of this stream is used; keep its video tiny and slow.
+        let config = SCStreamConfiguration::new()
+            .with_width(2)
+            .with_height(2)
+            .with_minimum_frame_interval(&CMTime::new(1, 1))
+            .with_captures_audio(true)
+            .with_sample_rate(SAMPLE_RATE as i32)
+            .with_channel_count(CHANNELS as i32);
+
+        let (packet_sender, packets) = mpsc::channel::<(f64, Vec<f32>)>();
+        let mut stream = SCStream::new(&filter, &config);
+        stream
+            .add_output_handler(
+                move |sample: CMSampleBuffer, of_type: SCStreamOutputType| {
+                    if !matches!(of_type, SCStreamOutputType::Audio) {
+                        return;
+                    }
+                    if let Some(packet) = interleaved_audio_packet(&sample, CHANNELS) {
+                        let _ = packet_sender.send(packet);
+                    }
+                },
+                SCStreamOutputType::Audio,
+            )
+            .ok_or("Could not attach the system audio output.")?;
+
+        let mut file = fs::File::create(&path).map_err(|error| error.to_string())?;
+        write_wave_header(&mut file, &float_wave_format(SAMPLE_RATE, CHANNELS as u16), 0)?;
+
+        let start_host_seconds = host_time_seconds();
+        let start_instant = Instant::now();
+        stream
+            .start_capture()
+            .map_err(|error| screen_capture_permission_error(&error.to_string()))?;
+        if let Some(sender) = ready_sender.take() {
+            let _ = sender.send(Ok(start_instant));
+        }
+
+        let frame_bytes = CHANNELS * std::mem::size_of::<f32>();
+        let sample_rate = u64::from(SAMPLE_RATE);
+        let mut next_position = Some(0_u64);
+        let mut total_frames_written = 0_u64;
+        let mut data_bytes = 0_u32;
+        let mut write_packet = |file: &mut fs::File, (pts, samples): (f64, Vec<f32>)| -> Result<(), String> {
+            let frames = (samples.len() / CHANNELS) as u64;
+            if frames == 0 {
+                return Ok(());
+            }
+            let mut position = ((pts - start_host_seconds) * sample_rate as f64).round().max(0.0) as u64;
+            if let Some(expected) = next_position {
+                if position.abs_diff(expected) <= JITTER_FRAMES {
+                    position = expected;
+                }
+            }
+            let (gap_frames, overlap_frames, following_position) =
+                capture_packet_alignment(next_position, position, frames as u32, true);
+            if gap_frames > 0 {
+                write_silence_frames(file, frame_bytes, gap_frames, sample_rate, &mut data_bytes)?;
+                total_frames_written = total_frames_written.saturating_add(gap_frames);
+            }
+            let writable = &samples[overlap_frames as usize * CHANNELS..];
+            if !writable.is_empty() {
+                let bytes: Vec<u8> = writable.iter().flat_map(|sample| sample.to_le_bytes()).collect();
+                file.write_all(&bytes).map_err(|error| error.to_string())?;
+                data_bytes = data_bytes.saturating_add(bytes.len() as u32);
+                total_frames_written = total_frames_written.saturating_add((writable.len() / CHANNELS) as u64);
+            }
+            next_position = following_position;
+            Ok(())
+        };
+
+        while !stop.load(Ordering::SeqCst) {
+            match packets.recv_timeout(Duration::from_millis(20)) {
+                Ok(packet) => write_packet(&mut file, packet)?,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let final_elapsed = start_instant.elapsed().as_secs_f64();
+        let _ = stream.stop_capture();
+        while let Ok(packet) = packets.try_recv() {
+            write_packet(&mut file, packet)?;
+        }
+
+        let final_expected = (final_elapsed * sample_rate as f64) as u64;
+        if final_expected > total_frames_written {
+            write_silence_frames(
+                &mut file,
+                frame_bytes,
+                final_expected - total_frames_written,
+                sample_rate,
+                &mut data_bytes,
+            )?;
+        }
+        finalize_wave_header(&mut file, data_bytes)?;
+        if data_bytes == 0 {
+            let _ = fs::remove_file(&path);
+            Ok(None)
+        } else {
+            Ok(Some(path))
+        }
+    })();
+    if let Some(sender) = ready_sender.take() {
+        let error = result
+            .as_ref()
+            .err()
+            .cloned()
+            .unwrap_or_else(|| "System audio capture stopped before startup completed.".to_string());
+        let _ = sender.send(Err(error));
+    }
+    result
+}
+
+/// Returns the packet's presentation time in host-clock seconds and its
+/// samples interleaved as `channels`-channel float frames.
+#[cfg(target_os = "macos")]
+fn interleaved_audio_packet(
+    sample: &screencapturekit::cm::CMSampleBuffer,
+    channels: usize,
+) -> Option<(f64, Vec<f32>)> {
+    let pts = sample.presentation_timestamp().as_seconds()?;
+    let list = sample.audio_buffer_list()?;
+    let floats = |data: &[u8]| -> Vec<f32> {
+        data.chunks_exact(4)
+            .map(|bytes| f32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect()
+    };
+    let first = list.get(0)?;
+    if list.num_buffers() == 1 && first.number_channels as usize == channels {
+        return Some((pts, floats(first.data())));
+    }
+    // ScreenCaptureKit delivers non-interleaved float32: one buffer per channel.
+    let planes: Vec<Vec<f32>> = (0..list.num_buffers())
+        .filter_map(|index| list.get(index))
+        .map(|buffer| floats(buffer.data()))
+        .collect();
+    let frames = planes.iter().map(Vec::len).min()?;
+    let mut interleaved = Vec::with_capacity(frames * channels);
+    for frame in 0..frames {
+        for channel in 0..channels {
+            let plane = &planes[channel.min(planes.len() - 1)];
+            interleaved.push(plane[frame]);
+        }
+    }
+    Some((pts, interleaved))
+}
+
+/// WAVEFORMATEX for IEEE float PCM.
+#[cfg(target_os = "macos")]
+fn float_wave_format(sample_rate: u32, channels: u16) -> Vec<u8> {
+    const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+    let block_align = channels * 4;
+    let mut format = Vec::with_capacity(18);
+    format.extend_from_slice(&WAVE_FORMAT_IEEE_FLOAT.to_le_bytes());
+    format.extend_from_slice(&channels.to_le_bytes());
+    format.extend_from_slice(&sample_rate.to_le_bytes());
+    format.extend_from_slice(&(sample_rate * u32::from(block_align)).to_le_bytes());
+    format.extend_from_slice(&block_align.to_le_bytes());
+    format.extend_from_slice(&32_u16.to_le_bytes());
+    format.extend_from_slice(&0_u16.to_le_bytes());
+    format
+}
+
+/// Seconds on the host clock that ScreenCaptureKit timestamps samples with.
+#[cfg(target_os = "macos")]
+fn host_time_seconds() -> f64 {
+    #[repr(C)]
+    struct MachTimebaseInfo {
+        numer: u32,
+        denom: u32,
+    }
+    extern "C" {
+        fn mach_absolute_time() -> u64;
+        fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+    }
+    let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
+    let ticks = unsafe {
+        mach_timebase_info(&mut info);
+        mach_absolute_time()
+    };
+    if info.denom == 0 {
+        return 0.0;
+    }
+    ticks as f64 * f64::from(info.numer) / f64::from(info.denom) / 1_000_000_000.0
+}
+
+#[cfg(target_os = "macos")]
+fn screen_capture_permission_error(detail: &str) -> String {
+    format!(
+        "QuickClipper needs Screen & System Audio Recording permission. Allow it in System Settings > Privacy & Security > Screen & System Audio Recording, then reopen QuickClipper. ({detail})"
+    )
+}
+
 fn write_silence_frames(
     file: &mut fs::File,
     frame_bytes: usize,
@@ -2400,7 +3132,15 @@ fn mux_recording_audio(
     Ok(())
 }
 
-fn start_recording_overlay(parent_pid: u32, x: i32, y: i32, width: u32, height: u32) -> Result<Child, String> {
+#[cfg(not(target_os = "macos"))]
+fn start_recording_overlay(
+    _app: &tauri::AppHandle,
+    parent_pid: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> Result<RecordingOverlay, String> {
     let script = r#"
 $ParentPid = __PARENT_PID__
 $X = __X__
@@ -2537,10 +3277,66 @@ $window.Add_Closed({ $timer.Stop(); if ($script:parentProcess) { $script:parentP
         .map_err(|error| format!("Recording overlay failed: {}", error))
 }
 
-fn stop_recording_overlay(child: &mut Option<Child>) {
+#[cfg(not(target_os = "macos"))]
+fn stop_recording_overlay(child: &mut Option<RecordingOverlay>) {
     if let Some(mut overlay) = child.take() {
         let _ = overlay.kill();
         let _ = overlay.wait();
+    }
+}
+
+#[cfg(target_os = "macos")]
+const RECORDING_OVERLAY_LABEL: &str = "recording-overlay";
+
+/// The timer and border sit just outside the region, in a click-through
+/// window that is also excluded from screen capture.
+#[cfg(target_os = "macos")]
+fn start_recording_overlay(
+    app: &tauri::AppHandle,
+    _parent_pid: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> Result<RecordingOverlay, String> {
+    if let Some(previous) = app.get_webview_window(RECORDING_OVERLAY_LABEL) {
+        let _ = previous.destroy();
+    }
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+    let window = tauri::WebviewWindowBuilder::new(
+        app,
+        RECORDING_OVERLAY_LABEL,
+        tauri::WebviewUrl::App("index.html?overlay=1".into()),
+    )
+    .title("QuickClipper Recording")
+    .decorations(false)
+    .transparent(true)
+    .shadow(false)
+    .resizable(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .visible_on_all_workspaces(true)
+    .content_protected(true)
+    .focused(false)
+    .inner_size(f64::from(width) + 6.0, f64::from(height) + 42.0)
+    .position(f64::from(x) - 3.0, f64::from(y) - 36.0)
+    .build()
+    .map_err(|error| {
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+        format!("Recording overlay failed: {error}")
+    })?;
+    let _ = window.set_ignore_cursor_events(true);
+    raise_above_menu_bar(&window);
+    Ok(window)
+}
+
+#[cfg(target_os = "macos")]
+fn stop_recording_overlay(overlay: &mut Option<RecordingOverlay>) {
+    if let Some(window) = overlay.take() {
+        let _ = window
+            .app_handle()
+            .set_activation_policy(tauri::ActivationPolicy::Regular);
+        let _ = window.destroy();
     }
 }
 
@@ -2891,6 +3687,9 @@ fn encoder_args(key: &str) -> Vec<String> {
         "hevc-nvenc-fast" => vec!["-c:v", "hevc_nvenc", "-preset", "p1"],
         "hevc-nvenc" => vec!["-c:v", "hevc_nvenc", "-preset", "p5"],
         "hevc-nvenc-max" => vec!["-c:v", "hevc_nvenc", "-preset", "p7"],
+        "h264-videotoolbox" => vec!["-c:v", "h264_videotoolbox"],
+        // hvc1 tagging lets QuickTime and Safari play the file.
+        "hevc-videotoolbox" => vec!["-c:v", "hevc_videotoolbox", "-tag:v", "hvc1"],
         _ => vec!["-c:v", "libx264", "-preset", "medium"],
     }
     .into_iter()
@@ -2901,6 +3700,8 @@ fn encoder_args(key: &str) -> Vec<String> {
 fn preserve_quality_args(key: &str) -> Vec<String> {
     let args = if key.contains("nvenc") {
         vec!["-rc", "vbr", "-cq", "18", "-b:v", "0"]
+    } else if key.contains("videotoolbox") {
+        vec!["-q:v", "70"]
     } else if key.contains("x265") {
         vec!["-crf", "20"]
     } else {
@@ -2910,19 +3711,29 @@ fn preserve_quality_args(key: &str) -> Vec<String> {
 }
 
 fn encoder_presets() -> Vec<(&'static str, &'static str)> {
-    vec![
+    let mut presets = vec![
         ("x264-medium", "H.264 Medium"),
         ("x264-slow", "H.264 Slow"),
         ("x264-veryslow", "H.264 Veryslow"),
         ("x265-medium", "H.265 Medium"),
         ("x265-slow", "H.265 Slow"),
-        ("h264-nvenc-fast", "H.264 NVENC Fast"),
-        ("h264-nvenc", "H.264 NVENC Quality"),
-        ("h264-nvenc-max", "H.264 NVENC Max"),
-        ("hevc-nvenc-fast", "H.265 NVENC Fast"),
-        ("hevc-nvenc", "H.265 NVENC Quality"),
-        ("hevc-nvenc-max", "H.265 NVENC Max"),
-    ]
+    ];
+    if cfg!(target_os = "macos") {
+        presets.extend([
+            ("h264-videotoolbox", "H.264 VideoToolbox"),
+            ("hevc-videotoolbox", "H.265 VideoToolbox"),
+        ]);
+    } else {
+        presets.extend([
+            ("h264-nvenc-fast", "H.264 NVENC Fast"),
+            ("h264-nvenc", "H.264 NVENC Quality"),
+            ("h264-nvenc-max", "H.264 NVENC Max"),
+            ("hevc-nvenc-fast", "H.265 NVENC Fast"),
+            ("hevc-nvenc", "H.265 NVENC Quality"),
+            ("hevc-nvenc-max", "H.265 NVENC Max"),
+        ]);
+    }
+    presets
 }
 
 fn make_even(value: u32) -> u32 {
@@ -3032,6 +3843,8 @@ pub fn run() {
         .manage(AppState {
             recording: Mutex::new(None),
             exports: ExportJobs::default(),
+            #[cfg(target_os = "macos")]
+            region_selection: Mutex::new(None),
         })
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -3073,6 +3886,7 @@ pub fn run() {
             list_audio_devices,
             generate_waveform,
             open_region_selector,
+            finish_region_selection,
             export_clip,
             begin_export,
             cancel_export,
@@ -3087,12 +3901,31 @@ pub fn run() {
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                let _ = window.hide();
-                api.prevent_close();
+                if window.label() == "main" {
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
+            }
+            #[cfg(target_os = "macos")]
+            if let WindowEvent::Destroyed = event {
+                // A selector closed without a selection (for example with
+                // Cmd+W) cancels the pending selection.
+                if window.label().starts_with(REGION_SELECTOR_LABEL) {
+                    deliver_region_selection(&window.state::<AppState>(), window.label(), None);
+                }
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Clicking the Dock icon brings back a window hidden to the tray.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { has_visible_windows: false, .. } = event {
+                show_main_window(app);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
 }
 
 #[cfg(test)]
@@ -3210,6 +4043,122 @@ mod tests {
         let info = probe_video_file(&settings, &video, &video).unwrap().unwrap();
         assert_eq!((info.width, info.height), (320, 180));
         assert!(info.duration_seconds >= 0.9);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn region_selection_ignores_windows_from_earlier_selections() {
+        let state = AppState {
+            recording: Mutex::new(None),
+            exports: ExportJobs::default(),
+            region_selection: Mutex::new(None),
+        };
+        let (sender, receiver) = mpsc::channel();
+        *state.region_selection.lock().unwrap() = Some((2, sender));
+        let region = || Some(RecordingRegion { x: 1, y: 2, width: 30, height: 40 });
+
+        deliver_region_selection(&state, "region-selector-1-0", region());
+        assert!(receiver.try_recv().is_err());
+        assert!(state.region_selection.lock().unwrap().is_some());
+
+        deliver_region_selection(&state, "region-selector-2-1", region());
+        let delivered = receiver.try_recv().unwrap().unwrap();
+        assert_eq!((delivered.x, delivered.y, delivered.width, delivered.height), (1, 2, 30, 40));
+        assert!(state.region_selection.lock().unwrap().is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn avfoundation_start_is_read_from_the_input_summary() {
+        let stderr = "Input #0, avfoundation, from 'Capture screen 0:none':\n  Duration: N/A, start: 1146052.732084, bitrate: N/A\n  Stream #0:0: Video: rawvideo";
+        assert_eq!(avfoundation_start_seconds(stderr), Some(1146052.732084));
+        assert_eq!(avfoundation_start_seconds("Input #0, lavfi, from 'x':\n  Duration: N/A, start: 1.0"), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "captures the interactive macOS desktop with FFmpeg"]
+    fn avfoundation_records_live_region() {
+        let screens = macos_capture_screens().unwrap();
+        eprintln!(
+            "capture screens: {:?}",
+            screens
+                .iter()
+                .map(|screen| (screen.bounds, screen.scale, screen.pixel_width, screen.pixel_height))
+                .collect::<Vec<_>>()
+        );
+        let screen = &screens[0];
+        let folder = tempfile::tempdir().unwrap();
+        let video = folder.path().join("capture.mp4");
+        let mut settings = AppSettings::default();
+        settings.ffmpeg_path = std::env::var("QUICKCLIPPER_TEST_FFMPEG")
+            .unwrap_or_else(|_| "ffmpeg".to_string());
+        let request = RecordingRequest {
+            x: screen.bounds.left + 20,
+            y: screen.bounds.top + 20,
+            width: 320,
+            height: 180,
+            settings: settings.clone(),
+        };
+        let mut args = vec!["-hide_banner".into(), "-loglevel".into(), "error".into(), "-y".into()];
+        args.extend(recording_input_args(&request, 320, 180).unwrap());
+        args.extend([
+            "-t".into(),
+            "1".into(),
+            "-an".into(),
+            "-c:v".into(),
+            "libx264".into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+            video.to_string_lossy().to_string(),
+        ]);
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        run_command(&settings.ffmpeg_path, &refs, "AVFoundation test failed").unwrap();
+        let info = probe_video_file(&settings, &video, &video).unwrap().unwrap();
+        let expected = (
+            make_even((320.0 * screen.scale).round() as u32),
+            make_even((180.0 * screen.scale).round() as u32),
+        );
+        assert_eq!((info.width, info.height), expected);
+        assert!(info.duration_seconds >= 0.9);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "records live system audio through ScreenCaptureKit"]
+    fn screencapturekit_records_system_audio() {
+        let recording = start_loopback_recording().unwrap();
+        let mut sound = Command::new("afplay")
+            .arg("/System/Library/Sounds/Glass.aiff")
+            .spawn()
+            .unwrap();
+        thread::sleep(Duration::from_secs(2));
+        let _ = sound.wait();
+        let path = stop_loopback_recording(Some(recording)).unwrap().unwrap();
+        let output = Command::new(resolve_program("ffprobe"))
+            .args(["-v", "error", "-show_entries", "stream=codec_name,sample_rate,channels:format=duration", "-of", "default=noprint_wrappers=1"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
+        eprintln!("{text}");
+        let samples: Vec<f32> = fs::read(&path).unwrap()[58..]
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect();
+        let peak = samples.iter().fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+        let _ = fs::remove_file(&path);
+        eprintln!("peak {peak}");
+        assert!(text.contains("codec_name=pcm_f32le"));
+        assert!(text.contains("sample_rate=48000"));
+        let duration: f64 = text
+            .lines()
+            .find_map(|line| line.strip_prefix("duration="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(duration >= 1.9, "duration {duration}");
+        assert!(peak > 0.001, "captured audio was silent");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent } from 'react'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
-import { emit, listen } from '@tauri-apps/api/event'
+import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { disable, enable, isEnabled } from '@tauri-apps/plugin-autostart'
 import { register, unregisterAll } from '@tauri-apps/plugin-global-shortcut'
@@ -67,6 +67,8 @@ import { adjacentSourceFrame, cachedPreviewIndex, isCurrentFrameRequest, isFrame
 import { runExportJob } from '@/exportJob'
 import type { ExportOperation } from '@/exportJob'
 
+const isMac = typeof navigator !== 'undefined' && /Mac/.test(navigator.userAgent)
+
 const defaultSettings: AppSettings = {
   saveFolder: '',
   ffmpegPath: 'ffmpeg',
@@ -87,8 +89,8 @@ const defaultSettings: AppSettings = {
   audioDeviceName: '',
   startWithWindows: true,
   startHiddenInTray: true,
-  recordHotkey: 'Super+Shift+R',
-  resetHotkey: 'Super+Shift+4',
+  recordHotkey: isMac ? 'Control+Shift+R' : 'Super+Shift+R',
+  resetHotkey: isMac ? 'Control+Shift+4' : 'Super+Shift+4',
   githubRepositoryUrl: 'https://github.com/daveranan/clipper',
 }
 
@@ -98,12 +100,19 @@ const encoders = [
   ['x264-veryslow', 'H.264 Veryslow'],
   ['x265-medium', 'H.265 Medium'],
   ['x265-slow', 'H.265 Slow'],
-  ['h264-nvenc-fast', 'H.264 NVENC Fast'],
-  ['h264-nvenc', 'H.264 NVENC Quality'],
-  ['h264-nvenc-max', 'H.264 NVENC Max'],
-  ['hevc-nvenc-fast', 'H.265 NVENC Fast'],
-  ['hevc-nvenc', 'H.265 NVENC Quality'],
-  ['hevc-nvenc-max', 'H.265 NVENC Max'],
+  ...(isMac
+    ? ([
+        ['h264-videotoolbox', 'H.264 VideoToolbox'],
+        ['hevc-videotoolbox', 'H.265 VideoToolbox'],
+      ] as const)
+    : ([
+        ['h264-nvenc-fast', 'H.264 NVENC Fast'],
+        ['h264-nvenc', 'H.264 NVENC Quality'],
+        ['h264-nvenc-max', 'H.264 NVENC Max'],
+        ['hevc-nvenc-fast', 'H.265 NVENC Fast'],
+        ['hevc-nvenc', 'H.265 NVENC Quality'],
+        ['hevc-nvenc-max', 'H.265 NVENC Max'],
+      ] as const)),
 ] as const
 
 type TimelineDragState =
@@ -141,8 +150,14 @@ type EditSnapshot = {
 }
 
 function App() {
-  if (new URLSearchParams(window.location.search).get('selector') === '1') {
+  const params = new URLSearchParams(window.location.search)
+  if (params.get('selector') === '1') {
+    document.documentElement.classList.add('transparent-window')
     return <RegionSelector />
+  }
+  if (params.get('overlay') === '1') {
+    document.documentElement.classList.add('transparent-window')
+    return <RecordingOverlay />
   }
 
   return <MainApp />
@@ -224,7 +239,6 @@ function MainApp() {
   const viewerHasContentRef = useRef(false)
   const toggleRecordingRef = useRef<() => void>(() => undefined)
   const resetRecordingRef = useRef<() => void>(() => undefined)
-  const startRegionRecordingRef = useRef<(region: Omit<RecordingRequest, 'settings'>) => void>(() => undefined)
 
   useEffect(() => {
     if (!canUseTauri()) {
@@ -979,7 +993,7 @@ function MainApp() {
     try {
       const devices = await tauriInvoke<string[]>('list_audio_devices', { settings })
       setAudioDevices(devices)
-      setStatus(devices.length > 0 ? `Found ${devices.length} audio devices` : 'No FFmpeg dshow audio devices found')
+      setStatus(devices.length > 0 ? `Found ${devices.length} audio devices` : 'No FFmpeg audio devices found')
     } catch (error) {
       setStatus(shortError(error))
     }
@@ -1177,7 +1191,8 @@ function MainApp() {
     const request: RecordingRequest = { ...normalized, settings }
     await tauriInvoke<string>('start_recording', { request })
     setIsRecording(true)
-    setStatus(`Recording ${normalized.width}x${normalized.height} at ${normalized.x},${normalized.y} via ${settings.captureBackend === 'gdi' ? 'GDI' : 'Desktop Duplication'}`)
+    const method = isMac ? 'AVFoundation' : settings.captureBackend === 'gdi' ? 'GDI' : 'Desktop Duplication'
+    setStatus(`Recording ${normalized.width}x${normalized.height} at ${normalized.x},${normalized.y} via ${method}`)
   }
 
   const selectCaptureBackend = (captureBackend: AppSettings['captureBackend']) => {
@@ -1501,9 +1516,6 @@ function MainApp() {
     resetRecordingRef.current = () => {
       void resetRecording()
     }
-    startRegionRecordingRef.current = (region) => {
-      void startRecordingWithRegion(region)
-    }
   })
 
   const undoEditFromKey = useEffectEvent(undoEdit)
@@ -1787,16 +1799,21 @@ function MainApp() {
         if (disposed) {
           return
         }
-        await register(settings.recordHotkey, (event) => {
-          if (event.state === 'Pressed') {
-            toggleRecordingRef.current()
-          }
-        })
-        await register(settings.resetHotkey, (event) => {
-          if (event.state === 'Pressed') {
-            resetRecordingRef.current()
-          }
-        })
+        // An empty hotkey field means no hotkey for that action.
+        if (settings.recordHotkey.trim()) {
+          await register(settings.recordHotkey, (event) => {
+            if (event.state === 'Pressed') {
+              toggleRecordingRef.current()
+            }
+          })
+        }
+        if (settings.resetHotkey.trim()) {
+          await register(settings.resetHotkey, (event) => {
+            if (event.state === 'Pressed') {
+              resetRecordingRef.current()
+            }
+          })
+        }
       })
       .catch((error) => setStatus(`Hotkey unavailable: ${shortError(error)}`))
 
@@ -1813,9 +1830,6 @@ function MainApp() {
     const cleanups = Promise.all([
       listen('tray-record-toggle', () => toggleRecordingRef.current()),
       listen('tray-record-reset', () => resetRecordingRef.current()),
-      listen<Omit<RecordingRequest, 'settings'>>('region-selected', (event) => {
-        startRegionRecordingRef.current(event.payload)
-      }),
     ])
     return () => {
       void cleanups.then((items) => items.forEach((cleanup) => cleanup()))
@@ -2098,10 +2112,16 @@ function MainApp() {
             <CardContent className="space-y-2">
               <div className="space-y-1">
                 <Label>Capture Method</Label>
-                <Select value={settings.captureBackend} disabled={isRecording} onChange={(event) => selectCaptureBackend(event.target.value as AppSettings['captureBackend'])}>
-                  <option value="desktopDuplication">Desktop Duplication (GPU)</option>
-                  <option value="gdi">GDI (legacy)</option>
-                </Select>
+                {isMac ? (
+                  <Select value="avfoundation" disabled>
+                    <option value="avfoundation">AVFoundation (macOS)</option>
+                  </Select>
+                ) : (
+                  <Select value={settings.captureBackend} disabled={isRecording} onChange={(event) => selectCaptureBackend(event.target.value as AppSettings['captureBackend'])}>
+                    <option value="desktopDuplication">Desktop Duplication (GPU)</option>
+                    <option value="gdi">GDI (legacy)</option>
+                  </Select>
+                )}
               </div>
               <div className="grid grid-cols-2 gap-2">
                 <NumberField label="X" value={recordingRegion.x} onChange={(x) => setRecordingRegion((region) => ({ ...region, x }))} />
@@ -2643,7 +2663,7 @@ function MainApp() {
                   checked={settings.startWithWindows}
                   onChange={(event) => setSettings((value) => ({ ...value, startWithWindows: event.target.checked }))}
                 />
-                Start with Windows
+                {isMac ? 'Open at login' : 'Start with Windows'}
               </label>
               <label className="check-row">
                 <input
@@ -2652,7 +2672,7 @@ function MainApp() {
                   disabled={!settings.startWithWindows}
                   onChange={(event) => setSettings((value) => ({ ...value, startHiddenInTray: event.target.checked }))}
                 />
-                Start hidden in tray
+                {isMac ? 'Start hidden in menu bar' : 'Start hidden in tray'}
               </label>
             </div>
             <div className="modal-actions">
@@ -2836,11 +2856,32 @@ function TimelineWaveform({
 }
 
 function RegionSelector() {
-  const [start, setStart] = useState<{ x: number; y: number; screenX: number; screenY: number } | null>(null)
-  const [current, setCurrent] = useState<{ x: number; y: number; screenX: number; screenY: number } | null>(null)
+  const [start, setStart] = useState<{ x: number; y: number } | null>(null)
+  const [current, setCurrent] = useState<{ x: number; y: number } | null>(null)
+  const finishedRef = useRef(false)
+  // Each display gets its own selector window; its origin turns window
+  // coordinates into global display points.
+  const origin = useMemo(() => {
+    const params = new URLSearchParams(window.location.search)
+    return { x: Number(params.get('originX')) || 0, y: Number(params.get('originY')) || 0 }
+  }, [])
+
+  const finish = async (region: Omit<RecordingRequest, 'settings'> | null) => {
+    if (finishedRef.current) {
+      return
+    }
+    finishedRef.current = true
+    await invoke('finish_region_selection', { region })
+  }
 
   useEffect(() => {
-    void getCurrentWindow().setFocus()
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        void finish(null)
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
   }, [])
 
   const rect = start && current
@@ -2855,45 +2896,72 @@ function RegionSelector() {
   return (
     <main
       className="region-selector"
+      onContextMenu={(event) => {
+        event.preventDefault()
+        void finish(null)
+      }}
       onPointerDown={(event) => {
-        setStart({ x: event.clientX, y: event.clientY, screenX: event.screenX, screenY: event.screenY })
-        setCurrent({ x: event.clientX, y: event.clientY, screenX: event.screenX, screenY: event.screenY })
+        if (event.button !== 0) {
+          return
+        }
+        setStart({ x: event.clientX, y: event.clientY })
+        setCurrent({ x: event.clientX, y: event.clientY })
         event.currentTarget.setPointerCapture(event.pointerId)
       }}
       onPointerMove={(event) => {
         if (start) {
-          setCurrent({ x: event.clientX, y: event.clientY, screenX: event.screenX, screenY: event.screenY })
+          setCurrent({ x: event.clientX, y: event.clientY })
         }
       }}
-      onPointerUp={async (event) => {
-        if (!start) {
+      onPointerUp={(event) => {
+        if (!start || event.button !== 0) {
           return
-        }
-        const end = { x: event.clientX, y: event.clientY, screenX: event.screenX, screenY: event.screenY }
-        const width = Math.abs(end.screenX - start.screenX)
-        const height = Math.abs(end.screenY - start.screenY)
-        if (width > 8 && height > 8) {
-          await emit('region-selected', {
-            x: Math.min(start.screenX, end.screenX),
-            y: Math.min(start.screenY, end.screenY),
-            width,
-            height,
-          })
         }
         if (event.currentTarget.hasPointerCapture(event.pointerId)) {
           event.currentTarget.releasePointerCapture(event.pointerId)
         }
-        await getCurrentWindow().close()
-      }}
-      onKeyDown={async (event) => {
-        if (event.key === 'Escape') {
-          await getCurrentWindow().close()
+        const width = Math.round(Math.abs(event.clientX - start.x))
+        const height = Math.round(Math.abs(event.clientY - start.y))
+        if (width < 8 || height < 8) {
+          setStart(null)
+          setCurrent(null)
+          return
         }
+        void finish({
+          x: Math.round(origin.x + Math.min(start.x, event.clientX)),
+          y: Math.round(origin.y + Math.min(start.y, event.clientY)),
+          width,
+          height,
+        })
       }}
       tabIndex={0}
     >
       <div className="selector-help">Drag to select recording region. Escape cancels.</div>
       {rect && <div className="selector-rect" style={rect} />}
+    </main>
+  )
+}
+
+function RecordingOverlay() {
+  const [elapsed, setElapsed] = useState(0)
+
+  useEffect(() => {
+    const started = performance.now()
+    const timer = window.setInterval(() => setElapsed((performance.now() - started) / 1000), 100)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  const total = Math.floor(elapsed)
+  const hours = Math.floor(total / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  const secondsPart = total % 60
+  const pad = (value: number) => value.toString().padStart(2, '0')
+  const label = hours > 0 ? `${pad(hours)}:${pad(minutes)}:${pad(secondsPart)}` : `${pad(minutes)}:${pad(secondsPart)}`
+
+  return (
+    <main className="recording-overlay">
+      <div className="recording-overlay-timer">{label}</div>
+      <div className="recording-overlay-frame" />
     </main>
   )
 }
