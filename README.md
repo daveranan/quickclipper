@@ -17,7 +17,8 @@ QuickClipper also runs on macOS 13 or later, with the same recording, editing an
 - Recording uses FFmpeg's AVFoundation screen input at the display's full Retina resolution, so a 400x225 region records as 800x450 on a 2x display. The region has to fit on one display.
 - System audio is captured with ScreenCaptureKit, with no virtual audio driver needed.
 - macOS asks for **Screen & System Audio Recording** permission the first time you record. Allow QuickClipper in System Settings > Privacy & Security, then reopen it.
-- The region selector and the recording timer/border also appear over full-screen apps and games. While they are open, QuickClipper briefly hides its Dock icon, because macOS only allows accessory apps over another app's full-screen Space.
+- QuickClipper is a menu-bar app: it has no Dock icon and keeps running in the background, with its hotkeys, when you close its window or press Cmd+Q. To exit, choose **Quit** from its menu-bar icon.
+- The region selector and the recording timer/border also appear over full-screen apps and games.
 - Exports can use the VideoToolbox H.264/H.265 hardware encoders instead of NVENC.
 - The default hotkeys are Control+Shift+R and Control+Shift+4, because Cmd+Shift+4 is the system screenshot shortcut.
 - Install FFmpeg with `brew install ffmpeg`. QuickClipper finds it in `/opt/homebrew/bin` or `/usr/local/bin` even when started from Finder or at login.

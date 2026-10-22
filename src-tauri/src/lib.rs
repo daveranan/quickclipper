@@ -896,15 +896,11 @@ async fn open_region_selector(
         }
     }
     let restore = |app: &tauri::AppHandle| {
-        let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
         if let Some(pid) = previous_app {
             on_main_thread(app, move || unsafe { activate_app(pid) });
         }
     };
 
-    // macOS only lets accessory apps put windows over another app's
-    // full-screen Space, which is where games usually are.
-    let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
     if let Err(error) = open_region_selector_windows(&app, generation, &monitors) {
         let _ = state.region_selection.lock().map(|mut pending| pending.take());
         close_region_selectors(&app);
@@ -1062,7 +1058,7 @@ fn close_region_selectors(app: &tauri::AppHandle) {
 /// Floating windows sit below the menu bar and Dock, and stay out of other
 /// apps' full-screen Spaces. The selector and the recording overlay have to
 /// reach every pixel a region can include, including full-screen games (this
-/// also needs the accessory activation policy while they are open).
+/// also relies on QuickClipper being an accessory, menu-bar app).
 #[cfg(target_os = "macos")]
 fn raise_above_menu_bar(window: &tauri::WebviewWindow) {
     const NS_STATUS_WINDOW_LEVEL: isize = 25;
@@ -3302,7 +3298,6 @@ fn start_recording_overlay(
     if let Some(previous) = app.get_webview_window(RECORDING_OVERLAY_LABEL) {
         let _ = previous.destroy();
     }
-    let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
     let window = tauri::WebviewWindowBuilder::new(
         app,
         RECORDING_OVERLAY_LABEL,
@@ -3321,10 +3316,7 @@ fn start_recording_overlay(
     .inner_size(f64::from(width) + 6.0, f64::from(height) + 42.0)
     .position(f64::from(x) - 3.0, f64::from(y) - 36.0)
     .build()
-    .map_err(|error| {
-        let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
-        format!("Recording overlay failed: {error}")
-    })?;
+    .map_err(|error| format!("Recording overlay failed: {error}"))?;
     let _ = window.set_ignore_cursor_events(true);
     raise_above_menu_bar(&window);
     Ok(window)
@@ -3333,9 +3325,6 @@ fn start_recording_overlay(
 #[cfg(target_os = "macos")]
 fn stop_recording_overlay(overlay: &mut Option<RecordingOverlay>) {
     if let Some(window) = overlay.take() {
-        let _ = window
-            .app_handle()
-            .set_activation_policy(tauri::ActivationPolicy::Regular);
         let _ = window.destroy();
     }
 }
@@ -3799,6 +3788,67 @@ fn create_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+const HIDE_TO_MENU_BAR_ID: &str = "hide-to-menu-bar";
+
+/// The menu bar stays hidden for a menu-bar app, but its key equivalents
+/// still work. This is Tauri's default macOS menu, except that Cmd+Q puts
+/// QuickClipper back in the menu bar so its hotkeys keep working; Quit in the
+/// menu-bar icon's menu (and logging out) still exit.
+#[cfg(target_os = "macos")]
+fn background_app_menu(app: &tauri::App) -> tauri::Result<Menu<tauri::Wry>> {
+    use tauri::menu::{PredefinedMenuItem, Submenu};
+    let close_app = MenuItem::with_id(
+        app,
+        HIDE_TO_MENU_BAR_ID,
+        "Close QuickClipper",
+        true,
+        Some("CmdOrCtrl+Q"),
+    )?;
+    Menu::with_items(
+        app,
+        &[
+            &Submenu::with_items(
+                app,
+                "QuickClipper",
+                true,
+                &[
+                    &PredefinedMenuItem::about(app, None, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::hide(app, None)?,
+                    &PredefinedMenuItem::hide_others(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &close_app,
+                ],
+            )?,
+            &Submenu::with_items(
+                app,
+                "Edit",
+                true,
+                &[
+                    &PredefinedMenuItem::undo(app, None)?,
+                    &PredefinedMenuItem::redo(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::cut(app, None)?,
+                    &PredefinedMenuItem::copy(app, None)?,
+                    &PredefinedMenuItem::paste(app, None)?,
+                    &PredefinedMenuItem::select_all(app, None)?,
+                ],
+            )?,
+            &Submenu::with_items(
+                app,
+                "Window",
+                true,
+                &[
+                    &PredefinedMenuItem::minimize(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::close_window(app, None)?,
+                ],
+            )?,
+        ],
+    )
+}
+
 fn focus_webview_window(window: &tauri::WebviewWindow) -> Result<(), String> {
     window.show().map_err(|error| error.to_string())?;
     let _ = window.unminimize();
@@ -3859,6 +3909,26 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             create_tray(app)?;
+            // On macOS QuickClipper is a menu-bar app: no Dock icon, and it
+            // keeps running (with its hotkeys) when its window is closed.
+            // Accessory apps are also the only ones macOS lets draw the
+            // selector and overlay over another app's full-screen Space.
+            #[cfg(target_os = "macos")]
+            {
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                app.set_menu(background_app_menu(app)?)?;
+                app.on_menu_event(|app, event| {
+                    if event.id() == HIDE_TO_MENU_BAR_ID {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.hide();
+                        }
+                    }
+                });
+                // Accessory apps are not brought forward at launch.
+                if !should_start_hidden_in_tray() {
+                    show_main_window(app.handle());
+                }
+            }
             if should_start_hidden_in_tray() {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
