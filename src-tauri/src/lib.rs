@@ -3881,6 +3881,48 @@ fn should_start_hidden_in_tray() -> bool {
         .unwrap_or(true)
 }
 
+/// Runs in the running instance when QuickClipper is launched again.
+#[cfg(not(target_os = "macos"))]
+fn second_instance_launched(app: &tauri::AppHandle, args: Vec<String>) {
+    if !args.iter().any(|arg| arg == "--quickclipper-startup") {
+        show_main_window(app);
+    }
+}
+
+/// Locks a file in the app folder for as long as this process runs. Taking
+/// the lock is atomic, so of two copies started in the same moment at login
+/// only one gets it, and the kernel releases it when the process exits or
+/// crashes. (On macOS the single-instance plugin claims its socket
+/// asynchronously, so both copies can get past it.) Opening the running app
+/// from Finder reaches it as RunEvent::Reopen, not as a second process.
+#[cfg(target_os = "macos")]
+fn claim_single_instance() -> bool {
+    use std::os::fd::AsRawFd;
+    extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    let lock = app_root().and_then(|root| {
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(root.join("instance.lock"))
+            .map_err(|error| error.to_string())
+    });
+    let Ok(lock) = lock else {
+        // Running twice is better than not running at all.
+        return true;
+    };
+    if unsafe { flock(lock.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+        return false;
+    }
+    // Keep the file, and so the lock, open until the process exits.
+    std::mem::forget(lock);
+    true
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 #[cfg(test)]
 mod canvas_acceptance_tests;
@@ -3889,7 +3931,19 @@ mod canvas_acceptance_tests;
 mod export_capture_tests;
 
 pub fn run() {
-    tauri::Builder::default()
+    // A second copy (for example one started by a login item and another by
+    // "Open at login") would register the hotkeys again, so both would react
+    // to every press. The second copy exits instead.
+    #[cfg(target_os = "macos")]
+    if !claim_single_instance() {
+        return;
+    }
+    let builder = tauri::Builder::default();
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+        second_instance_launched(app, args)
+    }));
+    builder
         .manage(AppState {
             recording: Mutex::new(None),
             exports: ExportJobs::default(),
