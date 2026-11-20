@@ -3872,6 +3872,61 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+/// The name QuickClipper starts at login under; on macOS also the name of its
+/// login agent, `~/Library/LaunchAgents/QuickClipper.plist`.
+const AUTOSTART_NAME: &str = "QuickClipper";
+
+/// Turns starting at login on or off. An enabled entry is written again so it
+/// picks up the current app path and arguments.
+#[tauri::command]
+fn set_start_at_login(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let autolaunch = app.autolaunch();
+    if autolaunch.is_enabled().map_err(|error| error.to_string())? {
+        autolaunch.disable().map_err(|error| error.to_string())?;
+    }
+    if enabled {
+        autolaunch.enable().map_err(|error| error.to_string())?;
+        #[cfg(target_os = "macos")]
+        mark_login_agent_interactive()?;
+    }
+    Ok(())
+}
+
+/// launchd throttles a login agent that names no ProcessType, and everything
+/// it starts: QuickClipper and its FFmpeg ran at a lowered priority, and the
+/// screen capture fell to about 27 frames a second. An interactive agent runs
+/// like an app opened from Finder.
+#[cfg(target_os = "macos")]
+fn mark_login_agent_interactive() -> Result<(), String> {
+    let home = std::env::var_os("HOME").ok_or("HOME is not set.")?;
+    let path = PathBuf::from(home)
+        .join("Library/LaunchAgents")
+        .join(format!("{AUTOSTART_NAME}.plist"));
+    let plist = fs::read_to_string(&path)
+        .map_err(|error| format!("Could not read the login agent: {error}"))?;
+    if let Some(marked) = with_interactive_process_type(&plist) {
+        fs::write(&path, marked)
+            .map_err(|error| format!("Could not update the login agent: {error}"))?;
+    }
+    Ok(())
+}
+
+/// The plist with `ProcessType` set to `Interactive`, or `None` when it
+/// already names a ProcessType or has no dictionary to add it to.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn with_interactive_process_type(plist: &str) -> Option<String> {
+    if plist.contains("<key>ProcessType</key>") {
+        return None;
+    }
+    let end = plist.rfind("</dict>")?;
+    Some(format!(
+        "{}<key>ProcessType</key>\n  <string>Interactive</string>\n  {}",
+        &plist[..end],
+        &plist[end..]
+    ))
+}
+
 fn should_start_hidden_in_tray() -> bool {
     if !std::env::args().any(|arg| arg == "--quickclipper-startup") {
         return false;
@@ -3954,7 +4009,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(
             tauri_plugin_autostart::Builder::new()
-                .app_name("QuickClipper")
+                .app_name(AUTOSTART_NAME)
                 .args(["--quickclipper-startup"])
                 .build(),
         )
@@ -4000,6 +4055,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_settings,
             save_settings,
+            set_start_at_login,
             open_video_dialog,
             prepare_preview_cache,
             prepare_playback_source,
@@ -4189,6 +4245,17 @@ mod tests {
         let delivered = receiver.try_recv().unwrap().unwrap();
         assert_eq!((delivered.x, delivered.y, delivered.width, delivered.height), (1, 2, 30, 40));
         assert!(state.region_selection.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn login_agent_is_marked_interactive_once() {
+        // As the autostart plugin writes it.
+        let plist = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n  <dict>\n  <key>Label</key>\n  <string>QuickClipper</string>\n  <key>ProgramArguments</key>\n  <array><string>/Applications/QuickClipper.app/Contents/MacOS/quickclipper</string><string>--quickclipper-startup</string></array>\n  <key>RunAtLoad</key>\n  <true/>\n  </dict>\n</plist>";
+        let marked = with_interactive_process_type(plist).unwrap();
+        assert!(marked.contains("<true/>\n  <key>ProcessType</key>\n  <string>Interactive</string>\n  </dict>\n</plist>"));
+        assert!(marked.contains("<string>--quickclipper-startup</string>"));
+        assert_eq!(with_interactive_process_type(&marked), None);
+        assert_eq!(with_interactive_process_type("<plist></plist>"), None);
     }
 
     #[cfg(target_os = "macos")]

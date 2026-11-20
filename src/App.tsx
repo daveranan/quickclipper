@@ -3,7 +3,6 @@ import type { PointerEvent as ReactPointerEvent } from 'react'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { disable, enable, isEnabled } from '@tauri-apps/plugin-autostart'
 import { register, unregisterAll } from '@tauri-apps/plugin-global-shortcut'
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
 import { relaunch } from '@tauri-apps/plugin-process'
@@ -246,18 +245,11 @@ function MainApp() {
       return
     }
 
-    Promise.all([tauriInvoke<AppSettings>('load_settings'), isEnabled().catch(() => false)])
-      .then(async ([loaded, startWithWindowsEnabled]) => {
+    tauriInvoke<AppSettings>('load_settings')
+      .then(async (loaded) => {
         const nextSettings = { ...defaultSettings, ...loaded }
         try {
-          if (nextSettings.startWithWindows) {
-            if (startWithWindowsEnabled) {
-              await disable()
-            }
-            await enable()
-          } else if (!nextSettings.startWithWindows && startWithWindowsEnabled) {
-            await disable()
-          }
+          await tauriInvoke('set_start_at_login', { enabled: nextSettings.startWithWindows })
         } catch (error) {
           setStatus(`Startup unavailable: ${shortError(error)}`)
         }
@@ -954,12 +946,7 @@ function MainApp() {
 
   const saveSettings = async () => {
     try {
-      if (settings.startWithWindows) {
-        await disable()
-        await enable()
-      } else {
-        await disable()
-      }
+      await tauriInvoke('set_start_at_login', { enabled: settings.startWithWindows })
       await tauriInvoke('save_settings', { settings })
       setStatus('Settings saved')
     } catch (error) {
