@@ -260,3 +260,161 @@ fn stopping_during_size_capped_encoding_removes_partial_files() {
         "Partial export files remain"
     );
 }
+
+#[test]
+fn parse_frame_rate_handles_rational_decimal_and_invalid_values() {
+    assert!((parse_frame_rate("30/1").unwrap() - 30.0).abs() < 1e-9);
+    assert!((parse_frame_rate("60000/1001").unwrap() - (60000.0 / 1001.0)).abs() < 1e-9);
+    assert!((parse_frame_rate("29.97").unwrap() - 29.97).abs() < 1e-9);
+    assert_eq!(parse_frame_rate("0/0"), None);
+    assert_eq!(parse_frame_rate("N/A"), None);
+    assert_eq!(parse_frame_rate("1000/1"), None);
+    assert_eq!(parse_frame_rate("0"), None);
+}
+
+#[test]
+fn probe_video_file_reads_stream_frame_rate() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg unavailable; skipping frame rate probe check");
+        return;
+    }
+    let folder = tempfile::tempdir().unwrap();
+    let source = fixture(folder.path());
+    let settings = AppSettings::default();
+    let info = probe_video_file(&settings, &source, &source).unwrap().unwrap();
+    let fps = info.frame_rate.expect("frame rate should be probed");
+    assert!((fps - 30.0).abs() < 0.01, "Expected ~30fps, got {fps}");
+}
+
+#[test]
+fn exact_frame_and_screenshot_select_active_frame_without_jumping_ahead() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg unavailable; skipping active-frame accuracy check");
+        return;
+    }
+    let folder = tempfile::tempdir().unwrap();
+    let source = folder.path().join("four_frames.mp4");
+    run_command(
+        "ffmpeg",
+        &[
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=black:size=64x64:rate=30,drawbox=color=red:t=fill:enable='eq(n,0)',drawbox=color=lime:t=fill:enable='eq(n,1)',drawbox=color=blue:t=fill:enable='eq(n,2)',drawbox=color=white:t=fill:enable='eq(n,3)'",
+            "-frames:v",
+            "4",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            &source.to_string_lossy(),
+        ],
+        "Four-frame fixture failed",
+    )
+    .unwrap();
+
+    let settings = AppSettings::default();
+    let classify = |pixel: [u8; 4]| -> &'static str {
+        if pixel[0] > 200 && pixel[1] > 200 && pixel[2] > 200 {
+            "white"
+        } else if pixel[0] > 200 && pixel[1] < 50 && pixel[2] < 50 {
+            "red"
+        } else if pixel[1] > 200 && pixel[0] < 50 && pixel[2] < 50 {
+            "green"
+        } else if pixel[2] > 200 && pixel[0] < 50 && pixel[1] < 50 {
+            "blue"
+        } else {
+            "other"
+        }
+    };
+
+    let cases = [
+        (0.0, "red"),
+        (0.016, "red"),
+        (1.0 / 30.0, "green"),
+        (0.050, "green"),
+        (2.0 / 30.0, "blue"),
+        (0.083, "blue"),
+        (3.0 / 30.0, "white"),
+        (0.130, "white"),
+        (2.0, "white"),
+    ];
+
+    for (index, (time, expected)) in cases.iter().enumerate() {
+        let exact_jpg = folder.path().join(format!("exact-{index}.jpg"));
+        extract_exact_frame_to_path(&source.to_string_lossy(), *time, &exact_jpg, &settings)
+            .unwrap();
+        let png_output = hidden_command(&settings.ffmpeg_path)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                &exact_jpg.to_string_lossy(),
+                "-c:v",
+                "png",
+                "-pix_fmt",
+                "rgba",
+                "-f",
+                "image2pipe",
+                "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(png_output.status.success());
+        let exact_img = image::load_from_memory_with_format(&png_output.stdout, image::ImageFormat::Png)
+            .unwrap()
+            .into_rgba8();
+        let exact_pixel = exact_img.get_pixel(32, 32).0;
+        assert_eq!(
+            classify(exact_pixel),
+            *expected,
+            "extract_exact_frame_to_path jumped to wrong frame at t={time}: pixel={exact_pixel:?}"
+        );
+
+        let shot = extract_screenshot(&source.to_string_lossy(), *time, &settings).unwrap();
+        let shot_pixel = shot.get_pixel(32, 32).0;
+        assert_eq!(
+            classify(shot_pixel),
+            *expected,
+            "extract_screenshot jumped to wrong frame at t={time}: pixel={shot_pixel:?}"
+        );
+    }
+
+    let cache = prepare_preview_cache(source.to_string_lossy().to_string(), 12, 1.0, settings.clone()).unwrap();
+    assert!(!cache.frames.is_empty(), "preview cache produced no frames");
+    let first_png = hidden_command(&settings.ffmpeg_path)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            &cache.frames[0],
+            "-c:v",
+            "png",
+            "-pix_fmt",
+            "rgba",
+            "-f",
+            "image2pipe",
+            "pipe:1",
+        ])
+        .output()
+        .unwrap();
+    assert!(first_png.status.success());
+    let first_img = image::load_from_memory_with_format(&first_png.stdout, image::ImageFormat::Png)
+        .unwrap()
+        .into_rgba8();
+    let first_pixel = first_img.get_pixel(32, 32).0;
+    let _ = fs::remove_dir_all(&cache.folder);
+    assert_eq!(
+        classify(first_pixel),
+        "red",
+        "preview cache frame 0 jumped ahead to future frame: pixel={first_pixel:?}"
+    );
+}

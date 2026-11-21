@@ -62,7 +62,20 @@ import {
   zoomViewerAt,
 } from '@/viewerGeometry'
 import type { ViewerPoint, ViewerSize, ViewerView } from '@/viewerGeometry'
-import { adjacentSourceFrame, cachedPreviewIndex, isCurrentFrameRequest, isFrameAtTime } from '@/viewerMedia'
+import {
+  adjacentSourceFrame,
+  effectiveVideoFrameRate,
+  isCurrentFrameRequest,
+  isVideoSettledForFrame,
+  normalizeSourceToSegments,
+  planSeekedFollowUp,
+  planVideoSeek,
+  resolvePreviewStillPath,
+  selectViewerDrawSource,
+  sourceToEditedTime,
+  timelineDurationForEdited,
+  videoFrameSeekTime,
+} from '@/viewerMedia'
 import { runExportJob } from '@/exportJob'
 import type { ExportOperation } from '@/exportJob'
 
@@ -209,9 +222,16 @@ function MainApp() {
   const [syncLinked, setSyncLinked] = useState(true)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [isGeneratingWaveform, setIsGeneratingWaveform] = useState(false)
+  const [suppressProxyCache, setSuppressProxyCache] = useState(false)
+  const [lockedTimelineDuration, setLockedTimelineDuration] = useState<number | null>(null)
   const frameRequestRef = useRef(0)
   const clipEpochRef = useRef(0)
   const currentTimeRef = useRef(0)
+  const exactFramePendingRef = useRef(false)
+  const expectedVideoTimeRef = useRef<number | null>(null)
+  const pendingVideoSeekRef = useRef<number | null>(null)
+  const isStepRepeatingRef = useRef(false)
+  const stepVideoFrameCallbackRef = useRef<number | null>(null)
   const timelineDragRef = useRef<TimelineDragState | null>(null)
   const timelineSurfaceRef = useRef<HTMLDivElement | null>(null)
   const cScrubModeRef = useRef(false)
@@ -263,6 +283,10 @@ function MainApp() {
   }, [currentTime])
 
   const clipName = clip ? fileName(clip.originalPath) : 'No clip'
+  const effectiveFrameRate = useMemo(
+    () => effectiveVideoFrameRate(clip?.frameRate, settings.frameRate),
+    [clip?.frameRate, settings.frameRate],
+  )
   const keptSeconds = useMemo(() => {
     const raw = Math.max(0, trimEnd - trimStart)
     const removed = cuts.reduce((sum, cut) => sum + Math.max(0, Math.min(cut.end, trimEnd) - Math.max(cut.start, trimStart)), 0)
@@ -275,11 +299,27 @@ function MainApp() {
     return Math.max(0, raw - removed)
   }, [audioCuts, audioTrimEnd, audioTrimStart])
 
+  const timelineDuration = useMemo(
+    () => (clip
+      ? (lockedTimelineDuration ?? timelineDurationForEdited(keptSeconds, timelineOffset, audioKeptSeconds, audioTimelineOffset))
+      : 1),
+    [audioKeptSeconds, audioTimelineOffset, clip, keptSeconds, lockedTimelineDuration, timelineOffset],
+  )
+
   useEffect(() => {
-    const duration = timelineDurationFor(clip?.durationSeconds ?? 1, keptSeconds, timelineOffset, audioKeptSeconds, audioTimelineOffset)
-    const span = duration / Math.max(1, timelineZoom)
-    setTimelineStart((value) => clamp(value, 0, Math.max(0, duration - span)))
-  }, [audioKeptSeconds, audioTimelineOffset, clip?.durationSeconds, keptSeconds, timelineOffset, timelineZoom])
+    const span = timelineDuration / Math.max(1, timelineZoom)
+    setTimelineStart((value) => clamp(value, 0, Math.max(0, timelineDuration - span)))
+  }, [timelineDuration, timelineZoom])
+
+  const cancelStepVideoFrameCallback = useCallback(() => {
+    const media = playbackRef.current
+    if (stepVideoFrameCallbackRef.current !== null && media && typeof media.cancelVideoFrameCallback === 'function') {
+      media.cancelVideoFrameCallback(stepVideoFrameCallbackRef.current)
+    }
+    stepVideoFrameCallbackRef.current = null
+  }, [])
+
+  useEffect(() => () => cancelStepVideoFrameCallback(), [cancelStepVideoFrameCallback])
 
   useEffect(() => {
     if (!isPlaying || !clip) {
@@ -287,8 +327,14 @@ function MainApp() {
       return
     }
 
+    cancelStepVideoFrameCallback()
+    pendingVideoSeekRef.current = null
+    expectedVideoTimeRef.current = null
+    isStepRepeatingRef.current = false
     const media = playbackRef.current
     const startTime = currentTimeRef.current
+    const playableSegments = buildDisplayClips(trimStart, trimEnd, cuts)
+    const lastPlayableEnd = playableSegments[playableSegments.length - 1]?.sourceEnd ?? trimEnd
     if (media) {
       media.muted = audioMutedForSourceRef.current(startTime)
       media.volume = 1
@@ -317,9 +363,9 @@ function MainApp() {
       if (media) {
         media.muted = audioMutedForSourceRef.current(next)
       }
-      if (next >= trimEnd) {
-        currentTimeRef.current = trimEnd
-        setCurrentTime(trimEnd)
+      if (next >= lastPlayableEnd) {
+        currentTimeRef.current = lastPlayableEnd
+        setCurrentTime(lastPlayableEnd)
         setIsPlaying(false)
         media?.pause()
         return
@@ -336,27 +382,18 @@ function MainApp() {
       cancelAnimationFrame(frame)
       media?.pause()
     }
-  }, [clip, cuts, isPlaying, trimEnd, trimStart])
+  }, [cancelStepVideoFrameCallback, clip, cuts, isPlaying, trimEnd, trimStart])
 
   const previewSrc = useMemo(() => {
-    // C-scrub keeps the still mounted: it resolves to the preview-cache frame
-    // for the current time so the canvas can follow the cursor immediately.
-    // Only playback nulls it (the video is the live source while playing).
-    if (isPlaying && !exactFrame) {
-      return null
-    }
-    if (exactFrame) {
-      return convertFileSrc(exactFrame)
-    }
-    if (!preview || preview.frames.length === 0) {
-      return null
-    }
-    const index = cachedPreviewIndex(currentTime, preview.fps, preview.frames.length)
-    if (index === null) {
-      return null
-    }
-    return convertFileSrc(preview.frames[index])
-  }, [currentTime, exactFrame, isPlaying, preview])
+    const resolved = resolvePreviewStillPath({
+      isPlaying,
+      exactFrame,
+      suppressProxyCache,
+      currentTime,
+      preview,
+    })
+    return resolved ? convertFileSrc(resolved) : null
+  }, [currentTime, exactFrame, isPlaying, preview, suppressProxyCache])
   const clipMediaSrc = useMemo(() => (playbackPath ? convertFileSrc(playbackPath) : null), [playbackPath])
 
   useEffect(() => {
@@ -427,6 +464,36 @@ function MainApp() {
     viewerHasContentRef.current = false
   }, [clipMediaSrc])
 
+  const paintCanvasSource = useCallback((source: CanvasImageSource) => {
+    const canvas = viewerCanvasRef.current
+    const sourceSize = viewerSourceSize
+    const viewportSize = viewerSize
+    if (!canvas || !sourceSize || !viewportSize || canvas.width === 0 || canvas.height === 0) {
+      return
+    }
+    const context = canvas.getContext('2d')
+    if (!context) {
+      return
+    }
+    const view = viewerViewRef.current
+    const backingScaleX = canvas.width / Math.max(1, viewportSize.width)
+    const backingScaleY = canvas.height / Math.max(1, viewportSize.height)
+    context.setTransform(1, 0, 0, 1, 0, 0)
+    context.clearRect(0, 0, canvas.width, canvas.height)
+    context.imageSmoothingEnabled = true
+    context.imageSmoothingQuality = 'high'
+    context.setTransform(
+      backingScaleX * view.scale,
+      0,
+      0,
+      backingScaleY * view.scale,
+      backingScaleX * view.offsetX,
+      backingScaleY * view.offsetY,
+    )
+    context.drawImage(source, 0, 0, sourceSize.width, sourceSize.height)
+    viewerHasContentRef.current = true
+  }, [viewerSize, viewerSourceSize])
+
   const drawViewerFrame = useCallback(() => {
     const canvas = viewerCanvasRef.current
     const sourceSize = viewerSourceSize
@@ -442,6 +509,9 @@ function MainApp() {
     const still = viewerStillRef.current
     const videoDrawable = Boolean(video && video.readyState >= 2 && video.videoWidth > 0)
     const stillDrawable = Boolean(still && still.complete && still.naturalWidth > 0)
+    const videoDuration = video && Number.isFinite(video.duration) && video.duration > 0 ? video.duration : null
+    const expectedVideoTime = expectedVideoTimeRef.current
+      ?? (videoDuration !== null ? Math.min(currentTimeRef.current, videoDuration) : currentTimeRef.current)
     // True once the video has settled on the requested time (seek finished,
     // no seek in flight). Its frame is native resolution, so a settled video
     // is the highest-quality paused preview available.
@@ -449,61 +519,33 @@ function MainApp() {
       videoDrawable &&
       video !== null &&
       !video.seeking &&
-      isFrameAtTime(video.currentTime, currentTimeRef.current, settings.frameRate)
-    const paint = (source: CanvasImageSource) => {
-      const view = viewerViewRef.current
-      const backingScaleX = canvas.width / Math.max(1, viewportSize.width)
-      const backingScaleY = canvas.height / Math.max(1, viewportSize.height)
-      context.setTransform(1, 0, 0, 1, 0, 0)
-      context.clearRect(0, 0, canvas.width, canvas.height)
-      context.imageSmoothingEnabled = true
-      context.imageSmoothingQuality = 'high'
-      context.setTransform(
-        backingScaleX * view.scale,
-        0,
-        0,
-        backingScaleY * view.scale,
-        backingScaleX * view.offsetX,
-        backingScaleY * view.offsetY,
+      isVideoSettledForFrame(
+        video.currentTime,
+        expectedVideoTime,
+        effectiveFrameRate,
+        suppressProxyCache && !exactFramePendingRef.current,
       )
-      context.drawImage(source, 0, 0, sourceSize.width, sourceSize.height)
-      viewerHasContentRef.current = true
-    }
-    if (isPlaying) {
-      if (video && videoDrawable) {
-        paint(video)
-      }
-      // else: video not ready yet — keep the last painted frame
-    } else if (isCScrubbing) {
-      // C-scrub follows the cursor with the preview-cache still; the video
-      // lags behind in-flight seeks, so it is never drawn while C-scrubbing.
-      if (still && stillDrawable) {
-        paint(still)
-      }
-      // else: next cache frame still loading — keep the last painted frame
-    } else if (exactFrame && stillDrawable) {
-      if (still) {
-        paint(still)
-      }
-    } else if (videoCurrent) {
-      if (video) {
-        paint(video)
-      }
-    } else if (stillDrawable) {
-      if (still) {
-        paint(still)
-      }
-    } else if (videoDrawable && !viewerHasContentRef.current) {
-      // Preparing state: the video is the only media and nothing is painted yet.
-      if (video) {
-        paint(video)
-      }
-    } else if (!viewerHasContentRef.current) {
+    const sourceChoice = selectViewerDrawSource({
+      isPlaying,
+      isCScrubbing,
+      exactFrameReady: Boolean(exactFrame),
+      exactFramePending: exactFramePendingRef.current,
+      suppressProxyCache,
+      videoDrawable,
+      videoCurrent,
+      stillDrawable,
+      hasPaintedContent: viewerHasContentRef.current,
+    })
+    if (sourceChoice === 'video' && video) {
+      paintCanvasSource(video)
+    } else if (sourceChoice === 'still' && still) {
+      paintCanvasSource(still)
+    } else if (sourceChoice === 'clear') {
       context.setTransform(1, 0, 0, 1, 0, 0)
       context.clearRect(0, 0, canvas.width, canvas.height)
     }
-    // else: a new still is loading — keep the last painted frame (no flicker)
-  }, [exactFrame, isCScrubbing, isPlaying, settings.frameRate, viewerSize, viewerSourceSize])
+    // 'hold' skips drawing so the canvas preserves the last valid true frame without flashing.
+  }, [effectiveFrameRate, exactFrame, isCScrubbing, isPlaying, paintCanvasSource, suppressProxyCache, viewerSize, viewerSourceSize])
 
   useEffect(() => {
     const media = playbackRef.current
@@ -547,7 +589,7 @@ function MainApp() {
     }
     const frame = requestAnimationFrame(drawViewerFrame)
     return () => cancelAnimationFrame(frame)
-  }, [clipMediaSrc, drawViewerFrame, isCScrubbing, isPlaying, previewSrc, viewerDrawTick, viewerMediaSize, viewerSize, viewerView])
+  }, [clipMediaSrc, drawViewerFrame, isCScrubbing, isPlaying, previewSrc, suppressProxyCache, viewerDrawTick, viewerMediaSize, viewerSize, viewerView])
 
   const commitViewerView = useCallback((update: (current: ViewerView) => ViewerView) => {
     setViewerView((current) => {
@@ -673,7 +715,7 @@ function MainApp() {
   }, [outputHeight, outputWidth, settings.audioQuality, settings.includeAudio, settings.includeVideo, settings.maxMegabytes, settings.qualityTargetKbps])
 
   const timelineViewport = useMemo(() => {
-    const duration = timelineDurationFor(clip?.durationSeconds || 1, keptSeconds, timelineOffset, audioKeptSeconds, audioTimelineOffset)
+    const duration = timelineDuration
     const span = duration / Math.max(1, timelineZoom)
     const start = clamp(timelineStart, 0, Math.max(0, duration - span))
     return {
@@ -683,7 +725,7 @@ function MainApp() {
       sourceDuration: clip?.durationSeconds ?? 0,
       span,
     }
-  }, [audioKeptSeconds, audioTimelineOffset, clip?.durationSeconds, keptSeconds, timelineOffset, timelineStart, timelineZoom])
+  }, [clip?.durationSeconds, timelineDuration, timelineStart, timelineZoom])
 
   const videoClipSegments = useMemo(() => {
     if (!clip) {
@@ -691,6 +733,11 @@ function MainApp() {
     }
     return buildDisplayClips(trimStart, trimEnd, cuts, timelineOffset)
   }, [clip, cuts, timelineOffset, trimEnd, trimStart])
+
+  const editedCurrentTime = useMemo(
+    () => (clip ? sourceToEditedTime(currentTime, videoClipSegments) : 0),
+    [clip, currentTime, videoClipSegments],
+  )
 
   const audioClipSegments = useMemo(() => {
     if (!clip) {
@@ -762,7 +809,19 @@ function MainApp() {
     clearClipSelection()
     setPendingCutStart(null)
     if (clip) {
-      setCurrentTime((value) => clamp(value, snapshot.trimStart, snapshot.trimEnd))
+      const nextSegments = buildDisplayClips(snapshot.trimStart, snapshot.trimEnd, snapshot.cuts, snapshot.timelineOffset)
+      const nextSource = nextSegments.length > 0
+        ? normalizeSourceToSegments(currentTimeRef.current, nextSegments)
+        : clamp(currentTimeRef.current, snapshot.trimStart, snapshot.trimEnd)
+      currentTimeRef.current = nextSource
+      expectedVideoTimeRef.current = null
+      pendingVideoSeekRef.current = null
+      setCurrentTime(nextSource)
+      const media = playbackRef.current
+      if (media) {
+        const videoDuration = Number.isFinite(media.duration) && media.duration > 0 ? media.duration : clip.durationSeconds
+        media.currentTime = videoFrameSeekTime(nextSource, effectiveFrameRate, videoDuration)
+      }
     }
   }
 
@@ -814,20 +873,32 @@ function MainApp() {
   }
 
   const clearExactFrame = () => {
+    cancelStepVideoFrameCallback()
     frameRequestRef.current += 1
+    exactFramePendingRef.current = false
+    expectedVideoTimeRef.current = null
+    pendingVideoSeekRef.current = null
+    setSuppressProxyCache(false)
     setExactFrame(null)
   }
 
   const loadClip = useCallback(
     async (nextClip: VideoInfo) => {
       const clipEpoch = ++clipEpochRef.current
+      cancelStepVideoFrameCallback()
       frameRequestRef.current += 1
+      exactFramePendingRef.current = false
+      expectedVideoTimeRef.current = null
+      pendingVideoSeekRef.current = null
+      isStepRepeatingRef.current = false
       viewerClipIdRef.current = null
       setClip(nextClip)
       setPreview(null)
       setPlaybackPath(null)
       setWaveform(null)
       setExactFrame(null)
+      setSuppressProxyCache(false)
+      setLockedTimelineDuration(null)
       setLastExport(null)
       setCurrentTime(0)
       setTrimStart(0)
@@ -897,7 +968,7 @@ function MainApp() {
         }
       }
     },
-    [settings],
+    [cancelStepVideoFrameCallback, settings],
   )
 
   const showExactFrame = useCallback(
@@ -908,23 +979,29 @@ function MainApp() {
       const clipEpoch = clipEpochRef.current
       const requestId = ++frameRequestRef.current
       const request = { clipEpoch, requestId, secondsAt: time }
-      setExactFrame(null)
+      // Hold the current frame rather than dropping back to the 12fps proxy cache while extracting.
+      exactFramePendingRef.current = true
+      setSuppressProxyCache(true)
       try {
         const path = await tauriInvoke<string>('extract_exact_frame', {
           inputPath: clip.path,
           secondsAt: time,
           settings,
         })
-        if (isCurrentFrameRequest(request, clipEpochRef.current, frameRequestRef.current, currentTimeRef.current, settings.frameRate)) {
+        if (isCurrentFrameRequest(request, clipEpochRef.current, frameRequestRef.current, currentTimeRef.current, effectiveFrameRate)) {
+          exactFramePendingRef.current = false
           setExactFrame(path)
         }
       } catch (error) {
-        if (isCurrentFrameRequest(request, clipEpochRef.current, frameRequestRef.current, currentTimeRef.current, settings.frameRate)) {
+        if (isCurrentFrameRequest(request, clipEpochRef.current, frameRequestRef.current, currentTimeRef.current, effectiveFrameRate)) {
+          exactFramePendingRef.current = false
+          setSuppressProxyCache(false)
           setStatus(shortError(error))
+          bumpViewerDraw()
         }
       }
     },
-    [clip, settings],
+    [bumpViewerDraw, clip, effectiveFrameRate, settings],
   )
   const requestExactFrameFromKey = useEffectEvent((time: number) => {
     void showExactFrame(time)
@@ -1243,31 +1320,163 @@ function MainApp() {
     }
   }
 
+  const isActivelyScrubbing = () => (
+    cScrubModeRef.current
+    || isStepRepeatingRef.current
+    || (timelineDragRef.current !== null && timelineDragRef.current.mode !== 'pan' && timelineDragRef.current.mode !== 'marquee')
+  )
+
+  const dispatchVideoSeek = (media: HTMLVideoElement, target: number) => {
+    cancelStepVideoFrameCallback()
+    media.currentTime = target
+    if (typeof media.requestVideoFrameCallback === 'function') {
+      stepVideoFrameCallbackRef.current = media.requestVideoFrameCallback(() => {
+        stepVideoFrameCallbackRef.current = null
+        bumpViewerDraw()
+      })
+    }
+  }
+
+  const requestVideoSeek = (nextSource: number, options: { coalesce: boolean }) => {
+    const media = playbackRef.current
+    if (!media) {
+      return
+    }
+    frameRequestRef.current += 1
+    exactFramePendingRef.current = false
+    setExactFrame(null)
+    setSuppressProxyCache(true)
+    const videoDuration = Number.isFinite(media.duration) && media.duration > 0 ? media.duration : clip?.durationSeconds
+    const seekTarget = videoFrameSeekTime(nextSource, effectiveFrameRate, videoDuration)
+    currentTimeRef.current = nextSource
+    expectedVideoTimeRef.current = seekTarget
+    setCurrentTime(nextSource)
+    const plan = planVideoSeek({
+      currentVideoTime: media.currentTime,
+      targetVideoTime: seekTarget,
+      isSeeking: media.seeking,
+      coalesce: options.coalesce,
+    })
+    if (plan.action === 'queue') {
+      pendingVideoSeekRef.current = plan.target
+      return
+    }
+    pendingVideoSeekRef.current = null
+    if (plan.action === 'seek-now') {
+      dispatchVideoSeek(media, plan.target)
+    } else {
+      bumpViewerDraw()
+    }
+  }
+
+  const flushPendingVideoSeek = () => {
+    const target = pendingVideoSeekRef.current
+    const media = playbackRef.current
+    if (target === null || !media || media.seeking) {
+      return
+    }
+    pendingVideoSeekRef.current = null
+    dispatchVideoSeek(media, target)
+  }
+
+  const handleVideoSeeked = () => {
+    const media = playbackRef.current
+    if (!media) {
+      pendingVideoSeekRef.current = null
+      bumpViewerDraw()
+      return
+    }
+    const followUp = planSeekedFollowUp({
+      currentVideoTime: media.currentTime,
+      pendingSeekTarget: pendingVideoSeekRef.current,
+      activelyScrubbing: isActivelyScrubbing(),
+    })
+    pendingVideoSeekRef.current = null
+    if (followUp.nextSeekTarget !== null) {
+      if (followUp.paintNow && media.readyState >= 2 && media.videoWidth > 0) {
+        paintCanvasSource(media)
+      }
+      dispatchVideoSeek(media, followUp.nextSeekTarget)
+      return
+    }
+    bumpViewerDraw()
+  }
+
   const seek = (value: number, exact = false) => {
     const next = normalizePlayableSourceTime(value, cuts, trimStart, trimEnd)
+    const media = playbackRef.current
+    const videoReady = Boolean(media && media.readyState >= 2 && media.videoWidth > 0)
+    if (isPlaying) {
+      currentTimeRef.current = next
+      expectedVideoTimeRef.current = null
+      pendingVideoSeekRef.current = null
+      setCurrentTime(next)
+      if (media) {
+        media.currentTime = next
+      }
+      clearExactFrame()
+      return
+    }
+    if (videoReady && media) {
+      requestVideoSeek(next, { coalesce: !exact && isActivelyScrubbing() })
+      return
+    }
     currentTimeRef.current = next
     setCurrentTime(next)
-    if (playbackRef.current) {
-      playbackRef.current.currentTime = next
-    }
     if (exact) {
+      expectedVideoTimeRef.current = null
+      pendingVideoSeekRef.current = null
+      if (media) {
+        media.currentTime = next
+      }
       void showExactFrame(next)
     } else {
+      if (media) {
+        media.currentTime = next
+      }
       clearExactFrame()
     }
   }
 
   const previewSourceTime = (value: number, exact = false) => {
     const next = clamp(value, 0, Math.max(clip?.durationSeconds ?? 0, 0))
+    const media = playbackRef.current
+    const videoReady = Boolean(media && media.readyState >= 2 && media.videoWidth > 0)
+    if (!isPlaying && videoReady && media) {
+      requestVideoSeek(next, { coalesce: !exact && isActivelyScrubbing() })
+      return
+    }
     currentTimeRef.current = next
     setCurrentTime(next)
-    if (playbackRef.current) {
-      playbackRef.current.currentTime = next
-    }
     if (exact) {
+      expectedVideoTimeRef.current = null
+      pendingVideoSeekRef.current = null
+      if (media) {
+        media.currentTime = next
+      }
       void showExactFrame(next)
     } else {
+      if (media) {
+        media.currentTime = next
+      }
       clearExactFrame()
+    }
+  }
+
+  const syncPlayheadToSegments = (nextSegments: DisplayClip[]) => {
+    if (nextSegments.length === 0) {
+      return
+    }
+    const nextSource = normalizeSourceToSegments(currentTimeRef.current, nextSegments)
+    if (Math.abs(nextSource - currentTimeRef.current) <= 1e-6) {
+      return
+    }
+    const media = playbackRef.current
+    const videoReady = Boolean(media && media.readyState >= 2 && media.videoWidth > 0)
+    if (videoReady && media) {
+      requestVideoSeek(nextSource, { coalesce: false })
+    } else {
+      previewSourceTime(nextSource, true)
     }
   }
 
@@ -1275,7 +1484,7 @@ function MainApp() {
     if (!snappingEnabled || !clip) {
       return value
     }
-    const threshold = Math.max(1 / Math.max(1, settings.frameRate), timelineViewport.span / 180)
+    const threshold = Math.max(1 / Math.max(1, effectiveFrameRate), timelineViewport.span / 180)
     const candidates = [
       ...videoClipSegments.flatMap((segment) => [segment.start, segment.end]),
       ...audioClipSegments.flatMap((segment) => [segment.start, segment.end]),
@@ -1303,10 +1512,37 @@ function MainApp() {
     if (!clip || videoClipSegments.length === 0) {
       return
     }
+    const media = playbackRef.current
+    let baseSource = currentTimeRef.current
+    if (isPlaying && media) {
+      media.pause()
+      if (Number.isFinite(media.currentTime)) {
+        baseSource = normalizePlayableSourceTime(media.currentTime, cuts, trimStart, trimEnd)
+      }
+    }
     setIsPlaying(false)
-    const nextSource = adjacentSourceFrame(currentTimeRef.current, direction, settings.frameRate, videoClipSegments)
-    previewSourceTime(nextSource, exact)
-    if (!exact) {
+    const nextSource = adjacentSourceFrame(baseSource, direction, effectiveFrameRate, videoClipSegments)
+    const videoReady = Boolean(media && media.readyState >= 2 && media.videoWidth > 0)
+
+    if (videoReady && media) {
+      isStepRepeatingRef.current = !exact
+      exactFrameAfterStepRef.current = false
+      setIsTimelinePreviewing(false)
+      requestVideoSeek(nextSource, { coalesce: !exact })
+      return
+    }
+
+    currentTimeRef.current = nextSource
+    expectedVideoTimeRef.current = null
+    pendingVideoSeekRef.current = null
+    setCurrentTime(nextSource)
+    setSuppressProxyCache(true)
+    if (media) {
+      media.currentTime = videoFrameSeekTime(nextSource, effectiveFrameRate, clip.durationSeconds)
+    }
+    if (exact) {
+      void showExactFrame(nextSource)
+    } else {
       setIsTimelinePreviewing(true)
       exactFrameAfterStepRef.current = true
     }
@@ -1317,13 +1553,24 @@ function MainApp() {
       return
     }
     if (isPlaying) {
-      setCurrentTime(currentTimeRef.current)
+      const media = playbackRef.current
+      media?.pause()
+      const pausedAt = media && Number.isFinite(media.currentTime)
+        ? normalizePlayableSourceTime(media.currentTime, cuts, trimStart, trimEnd)
+        : currentTimeRef.current
+      currentTimeRef.current = pausedAt
+      expectedVideoTimeRef.current = null
+      pendingVideoSeekRef.current = null
+      isStepRepeatingRef.current = false
+      setCurrentTime(pausedAt)
       setIsPlaying(false)
       return
     }
+    const firstPlayableStart = videoClipSegments[0]?.sourceStart ?? trimStart
+    const lastPlayableEnd = videoClipSegments[videoClipSegments.length - 1]?.sourceEnd ?? trimEnd
     let start = currentTimeRef.current
-    if (start >= trimEnd - 0.01) {
-      start = normalizePlayableSourceTime(trimStart, cuts, trimStart, trimEnd)
+    if (start >= lastPlayableEnd - 0.01) {
+      start = normalizePlayableSourceTime(firstPlayableStart, cuts, trimStart, trimEnd)
       seek(start)
     } else {
       const normalized = normalizePlayableSourceTime(start, cuts, trimStart, trimEnd)
@@ -1341,7 +1588,7 @@ function MainApp() {
     }
     if (pendingCutStart === null) {
       setPendingCutStart(currentTime)
-      setStatus(`Cut start ${formatTime(currentTime)}`)
+      setStatus(`Cut start ${formatTime(editedCurrentTime)}`)
       return
     }
     const start = Math.min(pendingCutStart, currentTime)
@@ -1352,18 +1599,24 @@ function MainApp() {
       return
     }
     const targetTrack = selectedClip?.track ?? 'video'
+    const cutStartEdited = sourceToEditedTime(start, videoClipSegments)
+    const cutEndEdited = sourceToEditedTime(end, videoClipSegments)
     beginEdit('Cut')
     if (syncLinked) {
-      setCuts((current) => mergeCuts([...current, { start, end }]))
+      const nextCuts = mergeCuts([...cuts, { start, end }])
+      setCuts(nextCuts)
       setAudioCuts((current) => mergeCuts([...current, { start, end }]))
+      syncPlayheadToSegments(buildDisplayClips(trimStart, trimEnd, nextCuts, timelineOffset))
     } else if (targetTrack === 'audio') {
       setAudioCuts((current) => mergeCuts([...current, { start, end }]))
     } else {
-      setCuts((current) => mergeCuts([...current, { start, end }]))
+      const nextCuts = mergeCuts([...cuts, { start, end }])
+      setCuts(nextCuts)
+      syncPlayheadToSegments(buildDisplayClips(trimStart, trimEnd, nextCuts, timelineOffset))
     }
     clearClipSelection()
     finishEdit()
-    setStatus(`Cut ${formatTime(start)} to ${formatTime(end)}`)
+    setStatus(`Cut ${formatTime(cutStartEdited)} to ${formatTime(cutEndEdited)}`)
   }
 
   const removeCut = () => {
@@ -1408,10 +1661,12 @@ function MainApp() {
     }
     beginEdit(selections.length > 1 ? 'Remove selected clips' : selections[0].track === 'audio' ? 'Remove audio clip' : 'Remove video clip')
     if (videoRanges.length > 0) {
-      setCuts((current) => mergeCuts([...current, ...videoRanges]))
+      const nextCuts = mergeCuts([...cuts, ...videoRanges])
+      setCuts(nextCuts)
       if (syncLinked) {
         setAudioCuts((current) => mergeCuts([...current, ...videoRanges]))
       }
+      syncPlayheadToSegments(buildDisplayClips(trimStart, trimEnd, nextCuts, timelineOffset))
     }
     if (audioRanges.length > 0) {
       setAudioCuts((current) => mergeCuts([...current, ...audioRanges]))
@@ -1425,7 +1680,7 @@ function MainApp() {
     if (!clip) {
       return
     }
-    const capSeconds = Math.max(1 / Math.max(1, settings.frameRate), Math.min(qualityMaxSeconds, clip.durationSeconds))
+    const capSeconds = Math.max(1 / Math.max(1, effectiveFrameRate), Math.min(qualityMaxSeconds, clip.durationSeconds))
     const nextEnd = keptSeconds > capSeconds
       ? sourceEndForKeptDuration(videoClipSegments, capSeconds)
       : trimEnd
@@ -1459,6 +1714,7 @@ function MainApp() {
     }
     beginEdit('Reset edits')
     setIsPlaying(false)
+    isStepRepeatingRef.current = false
     currentTimeRef.current = 0
     setCurrentTime(0)
     clearExactFrame()
@@ -1511,6 +1767,38 @@ function MainApp() {
   const stepFrameFromKey = useEffectEvent(stepFrame)
   const togglePlaybackFromKey = useEffectEvent(togglePlayback)
   const toggleCutFromKey = useEffectEvent(toggleCut)
+  const startCScrubFromKey = useEffectEvent(() => {
+    cScrubModeRef.current = true
+    setIsCScrubbing(true)
+    const media = playbackRef.current
+    if (media && media.readyState >= 2 && media.videoWidth > 0) {
+      if (isPlaying) {
+        media.pause()
+        const pausedAt = Number.isFinite(media.currentTime)
+          ? normalizePlayableSourceTime(media.currentTime, cuts, trimStart, trimEnd)
+          : currentTimeRef.current
+        currentTimeRef.current = pausedAt
+        setCurrentTime(pausedAt)
+        setIsPlaying(false)
+      }
+      setSuppressProxyCache(true)
+    }
+  })
+  const stopCScrubFromKey = useEffectEvent(() => {
+    cScrubModeRef.current = false
+    setIsCScrubbing(false)
+    flushPendingVideoSeek()
+  })
+  const finishStepRepeatFromKey = useEffectEvent(() => {
+    isStepRepeatingRef.current = false
+    flushPendingVideoSeek()
+  })
+  const flushScrubBlur = useEffectEvent(() => {
+    cScrubModeRef.current = false
+    isStepRepeatingRef.current = false
+    setIsCScrubbing(false)
+    flushPendingVideoSeek()
+  })
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1590,12 +1878,12 @@ function MainApp() {
       }
       if (event.key.toLowerCase() === 'c' && !event.repeat) {
         event.preventDefault()
-        cScrubModeRef.current = true
-        setIsCScrubbing(true)
+        startCScrubFromKey()
       }
     }
     const onKeyUp = (event: KeyboardEvent) => {
       if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+        finishStepRepeatFromKey()
         if (exactFrameAfterStepRef.current) {
           exactFrameAfterStepRef.current = false
           setIsTimelinePreviewing(false)
@@ -1604,8 +1892,7 @@ function MainApp() {
         return
       }
       if (event.key.toLowerCase() === 'c') {
-        cScrubModeRef.current = false
-        setIsCScrubbing(false)
+        stopCScrubFromKey()
       }
     }
     window.addEventListener('keydown', onKeyDown)
@@ -1624,7 +1911,7 @@ function MainApp() {
   }
 
   const setTimelineZoomAround = (nextZoom: number, anchorSeconds = sourceToTimelineTime(currentTime, videoClipSegments), anchorRatio = 0.5) => {
-    const duration = timelineDurationFor(clip?.durationSeconds || 1, keptSeconds, timelineOffset, audioKeptSeconds, audioTimelineOffset)
+    const duration = timelineDuration
     const zoom = clamp(nextZoom, 1, 80)
     const nextSpan = duration / zoom
     setTimelineZoom(zoom)
@@ -1656,7 +1943,8 @@ function MainApp() {
         setTimelineOffset(nextOffset)
       }
       previewSourceTime(nextStart)
-      exactFrameAfterDragRef.current = true
+      const media = playbackRef.current
+      exactFrameAfterDragRef.current = !(media && media.readyState >= 2 && media.videoWidth > 0)
       return
     }
     if (drag.mode === 'trim-end') {
@@ -1672,7 +1960,8 @@ function MainApp() {
         setTrimEnd(nextEnd)
       }
       previewSourceTime(nextEnd)
-      exactFrameAfterDragRef.current = true
+      const media = playbackRef.current
+      exactFrameAfterDragRef.current = !(media && media.readyState >= 2 && media.videoWidth > 0)
       return
     }
     if (drag.mode === 'cut-start' || drag.mode === 'cut-end') {
@@ -1701,7 +1990,8 @@ function MainApp() {
         setCuts(updateCuts)
       }
       previewSourceTime(previewAt)
-      exactFrameAfterDragRef.current = true
+      const media = playbackRef.current
+      exactFrameAfterDragRef.current = !(media && media.readyState >= 2 && media.videoWidth > 0)
       return
     }
     seekTimeline(secondsAt)
@@ -1711,7 +2001,7 @@ function MainApp() {
     if (!snappingEnabled || !clip) {
       return value
     }
-    const threshold = Math.max(1 / Math.max(1, settings.frameRate), timelineViewport.span / 180)
+    const threshold = Math.max(1 / Math.max(1, effectiveFrameRate), timelineViewport.span / 180)
     const trackCuts = track === 'audio' ? audioCuts : cuts
     const otherCuts = track === 'audio' ? cuts : audioCuts
     const trackStart = track === 'audio' ? audioTrimStart : trimStart
@@ -1753,8 +2043,7 @@ function MainApp() {
       seekTimelineFromScrub(timelineSeconds)
     }
     const onBlur = () => {
-      cScrubModeRef.current = false
-      setIsCScrubbing(false)
+      flushScrubBlur()
     }
     window.addEventListener('pointermove', onPointerMove)
     window.addEventListener('blur', onBlur)
@@ -1894,6 +2183,7 @@ function MainApp() {
     if (drag.mode !== 'seek' && drag.mode !== 'pan') {
       beginEdit('Timeline drag')
       setIsTimelinePreviewing(true)
+      setLockedTimelineDuration(timelineViewport.duration)
     }
     if (drag.mode === 'pan' || drag.mode === 'seek') {
       timelineDragRef.current = { ...drag, element } as TimelineDragState
@@ -2146,7 +2436,7 @@ function MainApp() {
                   {isViewerFullscreen ? <Minimize2 /> : <Maximize2 />}
                 </Button>
               </div>
-              <Badge>{clip ? `${formatTime(currentTime)} / ${formatTime(clip.durationSeconds)}` : '00:00.000'}</Badge>
+              <Badge>{clip ? `${formatTime(editedCurrentTime)} / ${formatTime(keptSeconds)}` : '00:00.000'}</Badge>
             </div>
           </div>
           <div
@@ -2172,7 +2462,7 @@ function MainApp() {
                   }
                   bumpViewerDraw()
                 }}
-                onSeeked={bumpViewerDraw}
+                onSeeked={handleVideoSeeked}
               />
             )}
             {previewSrc && (
@@ -2193,7 +2483,7 @@ function MainApp() {
               />
             )}
             <canvas className="viewer-canvas" ref={viewerCanvasRef} />
-            {!previewSrc && !clipMediaSrc && (
+            {!previewSrc && !clipMediaSrc && !suppressProxyCache && (
               <div className="empty-viewer">
                 <Film className="size-12" />
                 <span>{isPreparing ? 'Preparing preview' : 'Open or record a clip'}</span>
@@ -2311,7 +2601,7 @@ function MainApp() {
 
       <section className="timeline-panel">
         <div className="timeline-header">
-          <div className="timecode">{formatTime(currentTime)}</div>
+          <div className="timecode">{formatTime(editedCurrentTime)}</div>
           <div className="zoom-control">
             <Button size="icon" variant={snappingEnabled ? 'primary' : 'subtle'} onClick={() => setSnappingEnabled((value) => !value)}>
               <Magnet />
@@ -2334,7 +2624,7 @@ function MainApp() {
             <Badge>{timelineZoom.toFixed(1)}x</Badge>
           </div>
           <div className="timeline-stats">
-            <Badge>{formatTime(trimStart)} to {formatTime(trimEnd)}</Badge>
+            <Badge>{formatTime(0)} to {formatTime(keptSeconds)}</Badge>
             <Badge>{formatTime(keptSeconds)} kept</Badge>
             <Badge>{settings.sizeCapEnabled ? `${settings.maxMegabytes.toFixed(1)} MB target` : 'source quality'}</Badge>
             <Badge>{formatTime(qualityMaxSeconds)} max length</Badge>
@@ -2406,6 +2696,8 @@ function MainApp() {
               setMarqueeSelection(null)
               setIsTimelinePanning(false)
               setIsTimelinePreviewing(false)
+              setLockedTimelineDuration(null)
+              flushPendingVideoSeek()
               finishEdit()
               if (exactFrameAfterDragRef.current) {
                 exactFrameAfterDragRef.current = false
@@ -2420,7 +2712,9 @@ function MainApp() {
               setMarqueeSelection(null)
               setIsTimelinePanning(false)
               setIsTimelinePreviewing(false)
+              setLockedTimelineDuration(null)
               exactFrameAfterDragRef.current = false
+              flushPendingVideoSeek()
               finishEdit()
               if (event.currentTarget.hasPointerCapture(event.pointerId)) {
                 event.currentTarget.releasePointerCapture(event.pointerId)
@@ -2538,12 +2832,18 @@ function MainApp() {
         </div>
         <div className="trim-controls">
           <Button variant="subtle" disabled={!clip} onClick={() => {
+            if (!clip) {
+              return
+            }
             beginEdit('Set in')
             if (syncLinked || selectedClip?.track !== 'audio') {
-              setTrimStart(currentTime)
-            }
-            if (syncLinked || selectedClip?.track === 'audio') {
-              setAudioTrimStart(currentTime)
+              const nextStart = clamp(currentTime, 0, Math.max(0, trimEnd - 0.033))
+              setTrimStart(nextStart)
+              if (syncLinked) {
+                setAudioTrimStart(nextStart)
+              }
+            } else {
+              setAudioTrimStart(clamp(currentTime, 0, Math.max(0, audioTrimEnd - 0.033)))
             }
             finishEdit()
           }}>
@@ -2551,12 +2851,18 @@ function MainApp() {
             Set In
           </Button>
           <Button variant="subtle" disabled={!clip} onClick={() => {
+            if (!clip) {
+              return
+            }
             beginEdit('Set out')
             if (syncLinked || selectedClip?.track !== 'audio') {
-              setTrimEnd(currentTime)
-            }
-            if (syncLinked || selectedClip?.track === 'audio') {
-              setAudioTrimEnd(currentTime)
+              const nextEnd = clamp(currentTime, Math.min(clip.durationSeconds, trimStart + 0.033), clip.durationSeconds)
+              setTrimEnd(nextEnd)
+              if (syncLinked) {
+                setAudioTrimEnd(nextEnd)
+              }
+            } else {
+              setAudioTrimEnd(clamp(currentTime, Math.min(clip.durationSeconds, audioTrimStart + 0.033), clip.durationSeconds))
             }
             finishEdit()
           }}>
@@ -3330,10 +3636,6 @@ function timelineRangeStyle(start: number, end: number, viewport: { start: numbe
     left: `${left}%`,
     width: `${Math.max(0, ((end - start) / Math.max(0.001, viewport.span)) * 100)}%`,
   }
-}
-
-function timelineDurationFor(clipDuration: number, keptSeconds: number, timelineOffset: number, audioKeptSeconds = 0, audioTimelineOffset = 0) {
-  return Math.max(1, Math.max(clipDuration, timelineOffset + keptSeconds, audioTimelineOffset + audioKeptSeconds) + 30)
 }
 
 function dbToLinear(db: number) {

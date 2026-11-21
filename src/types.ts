@@ -38,6 +38,7 @@ export type VideoInfo = {
   width: number
   height: number
   durationSeconds: number
+  frameRate?: number | null
 }
 
 export type PreviewCache = {

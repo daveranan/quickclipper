@@ -189,6 +189,7 @@ pub struct VideoInfo {
     width: u32,
     height: u32,
     duration_seconds: f64,
+    frame_rate: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -309,34 +310,20 @@ fn extract_screenshot(input_path: &str, seconds_at: f64, settings: &AppSettings)
     if !seconds_at.is_finite() {
         return Err("Invalid screenshot time.".into());
     }
-    let source = Path::new(input_path);
-    let info = probe_video_file(settings, source, source)?.ok_or("Could not read source video.")?;
-    let time = seconds_at.clamp(0.0, info.duration_seconds);
-    let output = hidden_command(&settings.ffmpeg_path).args([
-        "-hide_banner", "-loglevel", "error", "-nostdin",
-        "-ss", &format!("{time:.6}"), "-i", input_path,
-        "-map", "0:v:0", "-an", "-sn", "-dn", "-frames:v", "1",
-        "-c:v", "png", "-pix_fmt", "rgba", "-f", "image2pipe", "pipe:1",
-    ]).output().map_err(|error| format!("Screenshot failed: {error}"))?;
-    if !output.status.success() {
-        return Err(command_error_message("Screenshot failed", &String::from_utf8_lossy(&output.stderr)));
-    }
-    let png = if output.stdout.is_empty() {
-        // At the end of a clip there may be no frame at or after the playhead.
-        // Decode the tail, retaining its last frame without buffering video in memory.
-        let folder = tempfile::Builder::new().prefix("quickclipper-frame-").tempdir().map_err(|error| error.to_string())?;
-        let path = folder.path().join("last.png");
-        run_command(&settings.ffmpeg_path, &[
-            "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-            "-sseof", "-1", "-noaccurate_seek", "-i", input_path,
-            "-map", "0:v:0", "-an", "-sn", "-dn",
-            "-c:v", "png", "-pix_fmt", "rgba", "-fps_mode", "passthrough", "-update", "1",
-            &path.to_string_lossy(),
-        ], "Screenshot failed")?;
-        fs::read(path).map_err(|_| "No video frame was available at this position.".to_string())?
-    } else {
-        output.stdout
-    };
+    let folder = tempfile::Builder::new()
+        .prefix("quickclipper-frame-")
+        .tempdir()
+        .map_err(|error| error.to_string())?;
+    let path = folder.path().join("frame.png");
+    extract_active_frame_file(
+        input_path,
+        seconds_at,
+        &path,
+        &["-c:v", "png", "-pix_fmt", "rgba"],
+        settings,
+        "Screenshot failed",
+    )?;
+    let png = fs::read(&path).map_err(|_| "No video frame was available at this position.".to_string())?;
     image::load_from_memory_with_format(&png, image::ImageFormat::Png)
         .map(|image| image.into_rgba8())
         .map_err(|error| format!("Could not decode screenshot: {error}"))
@@ -408,7 +395,7 @@ fn prepare_preview_cache(
     let pattern = folder.join("frame_%06d.jpg");
     let fps = fps.clamp(4, 12);
     let max_seconds = max_seconds.clamp(1.0, 180.0);
-    let filter = format!("fps={},scale=1280:-2", fps);
+    let filter = format!("fps={}:round=up,scale=1280:-2", fps);
     run_command(
         &settings.ffmpeg_path,
         &[
@@ -480,75 +467,141 @@ fn prepare_playback_source(input_path: String, settings: AppSettings) -> Result<
     Ok(proxy.to_string_lossy().to_string())
 }
 
+fn extract_active_frame_file(
+    input_path: &str,
+    seconds_at: f64,
+    output_path: &Path,
+    encode_args: &[&str],
+    settings: &AppSettings,
+    error_context: &str,
+) -> Result<(), String> {
+    if !seconds_at.is_finite() {
+        return Err("Invalid frame time.".into());
+    }
+    let target = seconds_at.max(0.0);
+    // Small epsilon absorbs microsecond rounding of k/fps without crossing into the next frame.
+    const EPS: f64 = 0.0001;
+    const FAST_WINDOW: f64 = 0.12;
+    let seek_start = (target - FAST_WINDOW).max(0.0);
+    let trim_filter = format!("trim=end={:.6}", target + EPS);
+    let output_arg = output_path.to_string_lossy().to_string();
+    let file_ready = |path: &Path| fs::metadata(path).is_ok_and(|meta| meta.len() > 0);
+    let mut first_error: Option<String> = None;
+
+    let mut try_ffmpeg = |before_input: &[&str], after_map: &[&str]| -> bool {
+        let _ = fs::remove_file(output_path);
+        let mut args: Vec<&str> = vec!["-hide_banner", "-loglevel", "error", "-nostdin", "-y"];
+        args.extend_from_slice(before_input);
+        args.extend_from_slice(&["-i", input_path, "-map", "0:v:0", "-an", "-sn", "-dn"]);
+        args.extend_from_slice(after_map);
+        args.extend_from_slice(encode_args);
+        args.push(&output_arg);
+        match run_command(&settings.ffmpeg_path, &args, error_context) {
+            Ok(()) if file_ready(output_path) => true,
+            Ok(()) => {
+                remove_empty_file(output_path);
+                false
+            }
+            Err(error) => {
+                remove_empty_file(output_path);
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                false
+            }
+        }
+    };
+
+    let seek_start_str = format!("{seek_start:.6}");
+    let target_str = format!("{target:.6}");
+    let passthrough_tail = [
+        "-vf",
+        trim_filter.as_str(),
+        "-fps_mode",
+        "passthrough",
+        "-update",
+        "1",
+    ];
+
+    // Attempt 1: fast accurate seek over a tiny window up to target + EPS; -update 1 retains the last frame <= target.
+    if try_ffmpeg(
+        &["-copyts", "-start_at_zero", "-ss", &seek_start_str],
+        &passthrough_tail,
+    ) {
+        return Ok(());
+    }
+
+    // Attempt 2: keyframe seek at target for sparse/VFR gaps wider than FAST_WINDOW.
+    if try_ffmpeg(
+        &[
+            "-copyts",
+            "-start_at_zero",
+            "-noaccurate_seek",
+            "-ss",
+            &target_str,
+        ],
+        &passthrough_tail,
+    ) {
+        return Ok(());
+    }
+
+    // Attempt 3: past-EOF or tail clamp -> last frame in stream.
+    if target > 0.0
+        && try_ffmpeg(
+            &["-sseof", "-1", "-noaccurate_seek"],
+            &["-fps_mode", "passthrough", "-update", "1"],
+        )
+    {
+        return Ok(());
+    }
+
+    // Attempt 4: target before first frame PTS -> first frame in stream.
+    if try_ffmpeg(&[], &["-frames:v", "1"]) {
+        return Ok(());
+    }
+
+    Err(first_error
+        .unwrap_or_else(|| format!("{error_context}: No video frame was available at this position.")))
+}
+
+fn extract_exact_frame_to_path(
+    input_path: &str,
+    seconds_at: f64,
+    frame_path: &Path,
+    settings: &AppSettings,
+) -> Result<(), String> {
+    extract_active_frame_file(
+        input_path,
+        seconds_at,
+        frame_path,
+        &["-f", "image2", "-q:v", "2"],
+        settings,
+        "Exact frame failed",
+    )
+}
+
 #[tauri::command]
-fn extract_exact_frame(
+async fn extract_exact_frame(
     input_path: String,
     seconds_at: f64,
     settings: AppSettings,
 ) -> Result<String, String> {
-    let probe = probe_video_file(&settings, Path::new(&input_path), Path::new(&input_path))?
-        .ok_or_else(|| "Could not read media duration.".to_string())?;
-    let safe_seconds = seconds_at
-        .max(0.0)
-        .min((probe.duration_seconds - 0.05).max(0.0));
-    let folder = preview_root()?.join("exact");
-    fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
-    let frame_path = folder.join(format!(
-        "frame-{}-{}.jpg",
-        Uuid::new_v4(),
-        millis(safe_seconds)
-    ));
-    let first = run_command(
-        &settings.ffmpeg_path,
-        &[
-            "-hide_banner",
-            "-y",
-            "-ss",
-            &seconds(safe_seconds),
-            "-i",
-            &input_path,
-            "-map",
-            "0:v:0",
-            "-an",
-            "-sn",
-            "-dn",
-            "-frames:v",
-            "1",
-            "-f",
-            "image2",
-            "-q:v",
-            "2",
-            &frame_path.to_string_lossy(),
-        ],
-        "Exact frame failed",
-    );
-    if let Err(first_error) = first {
-        run_command(
-            &settings.ffmpeg_path,
-            &[
-                "-hide_banner",
-                "-y",
-                "-i",
-                &input_path,
-                "-ss",
-                &seconds(safe_seconds),
-                "-map",
-                "0:v:0",
-                "-an",
-                "-sn",
-                "-dn",
-                "-frames:v",
-                "1",
-                "-f",
-                "image2",
-                "-q:v",
-                "2",
-                &frame_path.to_string_lossy(),
-            ],
-            &first_error,
-        )?;
+    if !seconds_at.is_finite() {
+        return Err("Invalid frame time.".into());
     }
-    Ok(frame_path.to_string_lossy().to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let folder = preview_root()?.join("exact");
+        fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
+        let frame_path = folder.join(format!(
+            "frame-{}-{}.jpg",
+            Uuid::new_v4(),
+            millis(seconds_at.max(0.0))
+        ));
+        extract_exact_frame_to_path(&input_path, seconds_at, &frame_path, &settings)?;
+        Ok(frame_path.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|error| format!("Exact frame worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -2250,6 +2303,28 @@ fn copy_file_to_clipboard(path: String) -> Result<(), String> {
         .map_err(|error| format!("Could not copy file to clipboard: {}", error))
 }
 
+fn parse_frame_rate(raw: &str) -> Option<f64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let rate = if let Some((num_str, den_str)) = trimmed.split_once('/') {
+        let num = num_str.trim().parse::<f64>().ok()?;
+        let den = den_str.trim().parse::<f64>().ok()?;
+        if !den.is_finite() || den <= 0.0 {
+            return None;
+        }
+        num / den
+    } else {
+        trimmed.parse::<f64>().ok()?
+    };
+    if rate.is_finite() && (0.5..=240.0).contains(&rate) {
+        Some(rate)
+    } else {
+        None
+    }
+}
+
 fn probe_video_file(
     settings: &AppSettings,
     media_path: &Path,
@@ -2272,7 +2347,7 @@ fn probe_video_file_with_control(
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=width,height:format=duration",
+            "stream=width,height,avg_frame_rate,r_frame_rate:format=duration",
             "-of",
             "default=noprint_wrappers=1",
             &media_path.to_string_lossy(),
@@ -2286,6 +2361,8 @@ fn probe_video_file_with_control(
     let mut width = 0;
     let mut height = 0;
     let mut duration_seconds = 0.0;
+    let mut avg_frame_rate: Option<f64> = None;
+    let mut r_frame_rate: Option<f64> = None;
     for line in text.lines() {
         if let Some(value) = line.strip_prefix("width=") {
             width = value.parse().unwrap_or(0);
@@ -2293,6 +2370,10 @@ fn probe_video_file_with_control(
             height = value.parse().unwrap_or(0);
         } else if let Some(value) = line.strip_prefix("duration=") {
             duration_seconds = value.parse().unwrap_or(0.0);
+        } else if let Some(value) = line.strip_prefix("avg_frame_rate=") {
+            avg_frame_rate = parse_frame_rate(value);
+        } else if let Some(value) = line.strip_prefix("r_frame_rate=") {
+            r_frame_rate = parse_frame_rate(value);
         }
     }
 
@@ -2307,6 +2388,7 @@ fn probe_video_file_with_control(
         width,
         height,
         duration_seconds,
+        frame_rate: avg_frame_rate.or(r_frame_rate),
     }))
 }
 
